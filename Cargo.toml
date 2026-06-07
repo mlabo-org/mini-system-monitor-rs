@@ -1,0 +1,9 @@
+[package]
+name = "mini-system-monitor-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.34.3"
+egui = "0.34.3"
+sysinfo = "0.39.3"
