@@ -1,3 +1,4 @@
+mod codex_usage;
 mod metrics;
 
 use std::{
@@ -7,6 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use codex_usage::{
+    CodexUsageContent, CodexUsagePoller, CodexUsageState, CodexUsageStatus, QuotaBucket,
+    QuotaWindow,
+};
 use eframe::egui::{
     self, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, RichText,
     Sense, Stroke, StrokeKind, TextStyle, Vec2,
@@ -23,6 +28,10 @@ const TRACK_BG: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 20);
 const TEXT_MAIN: Color32 = Color32::from_rgb(238, 243, 240);
 const TEXT_MUTED: Color32 = Color32::from_rgb(151, 161, 156);
 const TEXT_SUBTLE: Color32 = Color32::from_rgb(104, 115, 110);
+const CODEX_ACCENT: Color32 = Color32::from_rgb(91, 159, 255);
+const SPARK_ACCENT: Color32 = Color32::from_rgb(246, 190, 82);
+const WARNING_AMBER: Color32 = Color32::from_rgb(238, 170, 83);
+const ERROR_RED: Color32 = Color32::from_rgb(236, 100, 95);
 const JAPANESE_FONT_NAME: &str = "system_japanese";
 const JAPANESE_FONT_PATHS: &[&str] = &[
     "/System/Library/Fonts/Hiragino Sans.ttc",
@@ -38,8 +47,8 @@ const JAPANESE_FONT_PATHS: &[&str] = &[
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 300.0])
-            .with_min_inner_size([360.0, 280.0])
+            .with_inner_size([420.0, 430.0])
+            .with_min_inner_size([390.0, 410.0])
             .with_resizable(false)
             .with_transparent(true)
             .with_window_level(egui::WindowLevel::AlwaysOnTop),
@@ -57,6 +66,8 @@ struct MonitorApp {
     snapshot: Snapshot,
     rx: Receiver<Snapshot>,
     last_update: Instant,
+    codex_usage: CodexUsageState,
+    codex_rx: Receiver<CodexUsageState>,
 }
 
 impl MonitorApp {
@@ -65,11 +76,14 @@ impl MonitorApp {
         configure_style(&cc.egui_ctx);
 
         let (snapshot, rx) = start_metrics_sampler();
+        let codex_rx = start_codex_usage_sampler();
 
         Self {
             snapshot,
             rx,
             last_update: Instant::now(),
+            codex_usage: CodexUsageState::loading(),
+            codex_rx,
         }
     }
 
@@ -79,11 +93,18 @@ impl MonitorApp {
             self.last_update = Instant::now();
         }
     }
+
+    fn receive_latest_codex_usage(&mut self) {
+        while let Ok(codex_usage) = self.codex_rx.try_recv() {
+            self.codex_usage = codex_usage;
+        }
+    }
 }
 
 impl eframe::App for MonitorApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_latest_snapshot();
+        self.receive_latest_codex_usage();
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 
@@ -104,32 +125,10 @@ impl eframe::App for MonitorApp {
                 draw_header(ui, self.last_update);
 
                 ui.add_space(13.0);
-                draw_metric_card(
-                    ui,
-                    "CPU",
-                    "使用率",
-                    self.snapshot.cpu_percent,
-                    format!("{:.0}", self.snapshot.cpu_percent.clamp(0.0, 100.0)),
-                    "%",
-                    cpu_detail(&self.snapshot),
-                );
+                draw_system_card(ui, &self.snapshot);
 
                 ui.add_space(10.0);
-                draw_metric_card(
-                    ui,
-                    "メモリ",
-                    "使用量",
-                    self.snapshot.memory_percent,
-                    format!(
-                        "{:.1}/{:.1}",
-                        self.snapshot.memory_used_gib, self.snapshot.memory_total_gib
-                    ),
-                    "GiB",
-                    format!(
-                        "使用率 {:.0}%",
-                        self.snapshot.memory_percent.clamp(0.0, 100.0)
-                    ),
-                );
+                draw_codex_usage_card(ui, &self.codex_usage);
             },
         );
     }
@@ -212,6 +211,27 @@ fn start_metrics_sampler() -> (Snapshot, Receiver<Snapshot>) {
     (initial, rx)
 }
 
+fn start_codex_usage_sampler() -> Receiver<CodexUsageState> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let mut poller = CodexUsagePoller::new();
+
+        loop {
+            let state = poller.refresh();
+            let delay = poller.next_delay();
+
+            if tx.send(state).is_err() {
+                break;
+            }
+
+            thread::sleep(delay);
+        }
+    });
+
+    rx
+}
+
 fn draw_header(ui: &mut egui::Ui, last_update: Instant) {
     ui.horizontal(|ui| {
         ui.label(
@@ -230,17 +250,9 @@ fn draw_header(ui: &mut egui::Ui, last_update: Instant) {
     });
 }
 
-fn draw_metric_card(
-    ui: &mut egui::Ui,
-    title: &str,
-    subtitle: &str,
-    percent: f32,
-    value: String,
-    unit: &str,
-    detail: String,
-) {
+fn draw_system_card(ui: &mut egui::Ui, snapshot: &Snapshot) {
     let available_width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(available_width, 84.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(available_width, 112.0), Sense::hover());
     let painter = ui.painter_at(rect);
 
     painter.rect_filled(rect, 12.0, CARD_BG);
@@ -251,84 +263,318 @@ fn draw_metric_card(
         StrokeKind::Inside,
     );
 
-    let inner = rect.shrink2(Vec2::new(15.0, 11.0));
-    let progress_rect = Rect::from_min_max(
-        Pos2::new(inner.right() - 86.0, inner.top() + 9.0),
-        Pos2::new(inner.right(), inner.bottom() - 9.0),
-    );
-    let text_rect = Rect::from_min_max(
-        inner.left_top(),
-        Pos2::new(progress_rect.left() - 18.0, inner.bottom()),
-    );
-
-    ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
-        ui.set_clip_rect(text_rect);
-        ui.set_width(text_rect.width());
-
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(title).size(13.0).strong().color(TEXT_MAIN));
-            ui.label(RichText::new(subtitle).size(12.0).color(TEXT_MUTED));
-        });
-
-        ui.add_space(5.0);
-        ui.horizontal(|ui| {
-            let value_size = if value.chars().count() > 7 {
-                24.0
-            } else {
-                30.0
-            };
-            ui.label(RichText::new(value).size(value_size).color(TEXT_MAIN));
-            ui.add_space(2.0);
-            ui.label(RichText::new(unit).size(12.0).strong().color(ACCENT_GREEN));
-        });
-
-        ui.add_space(2.0);
-        ui.label(
-            RichText::new(compact_text(&detail, 34))
-                .size(11.0)
-                .color(TEXT_MUTED),
-        );
-    });
-
-    draw_progress_accent(&painter, progress_rect, percent);
-}
-
-fn draw_progress_accent(painter: &egui::Painter, rect: Rect, percent: f32) {
-    let clamped = percent.clamp(0.0, 100.0) / 100.0;
+    let inner = rect.shrink2(Vec2::new(15.0, 12.0));
     painter.text(
-        Pos2::new(rect.center().x, rect.top()),
-        Align2::CENTER_TOP,
-        format!("{:.0}%", percent.clamp(0.0, 100.0)),
-        FontId::proportional(18.0),
+        inner.left_top(),
+        Align2::LEFT_TOP,
+        "System",
+        FontId::proportional(14.0),
         TEXT_MAIN,
     );
     painter.text(
-        Pos2::new(rect.center().x, rect.top() + 24.0),
-        Align2::CENTER_TOP,
-        "使用率",
+        inner.right_top(),
+        Align2::RIGHT_TOP,
+        "CPU / メモリ",
         FontId::proportional(10.0),
         TEXT_SUBTLE,
     );
 
-    let track = Rect::from_min_size(
-        Pos2::new(rect.left(), rect.bottom() - 8.0),
-        Vec2::new(rect.width(), 5.0),
+    let column_top = inner.top() + 28.0;
+    let column_gap = 18.0;
+    let column_width = (inner.width() - column_gap) / 2.0;
+    let cpu_rect = Rect::from_min_size(
+        Pos2::new(inner.left(), column_top),
+        Vec2::new(column_width, inner.bottom() - column_top),
     );
-    painter.rect_filled(track, 3.0, TRACK_BG);
+    let memory_rect = Rect::from_min_size(
+        Pos2::new(cpu_rect.right() + column_gap, column_top),
+        Vec2::new(column_width, inner.bottom() - column_top),
+    );
+
+    let divider_x = cpu_rect.right() + column_gap / 2.0;
+    painter.line_segment(
+        [
+            Pos2::new(divider_x, column_top + 3.0),
+            Pos2::new(divider_x, inner.bottom() - 1.0),
+        ],
+        Stroke::new(1.0, PANEL_STROKE),
+    );
+
+    draw_system_metric(
+        &painter,
+        cpu_rect,
+        "CPU",
+        format!("{:.0}%", snapshot.cpu_percent.clamp(0.0, 100.0)),
+        cpu_detail(snapshot),
+        snapshot.cpu_percent,
+        ACCENT_GREEN,
+    );
+    draw_system_metric(
+        &painter,
+        memory_rect,
+        "メモリ",
+        format!(
+            "{:.1}/{:.1} GiB",
+            snapshot.memory_used_gib, snapshot.memory_total_gib
+        ),
+        format!("使用率 {:.0}%", snapshot.memory_percent.clamp(0.0, 100.0)),
+        snapshot.memory_percent,
+        CODEX_ACCENT,
+    );
+}
+
+fn draw_system_metric(
+    painter: &egui::Painter,
+    rect: Rect,
+    title: &str,
+    value: String,
+    detail: String,
+    percent: f32,
+    accent: Color32,
+) {
+    painter.text(
+        rect.left_top(),
+        Align2::LEFT_TOP,
+        title,
+        FontId::proportional(12.0),
+        TEXT_MUTED,
+    );
+    painter.text(
+        Pos2::new(rect.left(), rect.top() + 17.0),
+        Align2::LEFT_TOP,
+        value,
+        FontId::proportional(22.0),
+        TEXT_MAIN,
+    );
+    painter.text(
+        Pos2::new(rect.left(), rect.top() + 44.0),
+        Align2::LEFT_TOP,
+        compact_text(&detail, 22),
+        FontId::proportional(10.0),
+        TEXT_MUTED,
+    );
+
+    draw_metric_track(painter, rect, percent, accent);
+}
+
+fn draw_metric_track(painter: &egui::Painter, rect: Rect, percent: f32, accent: Color32) {
+    let clamped = percent.clamp(0.0, 100.0) / 100.0;
+    let track = Rect::from_min_size(
+        Pos2::new(rect.left(), rect.bottom() - 5.0),
+        Vec2::new(rect.width(), 4.0),
+    );
+    painter.rect_filled(track, 2.0, TRACK_BG);
 
     let fill = Rect::from_min_size(
         track.left_top(),
         Vec2::new(track.width() * clamped, track.height()),
     );
-    painter.rect_filled(fill, 3.0, ACCENT_GREEN);
-    painter.circle_filled(
-        Pos2::new(
-            fill.right().clamp(track.left(), track.right()),
-            track.center().y,
-        ),
-        2.5,
-        ACCENT_GREEN,
+    painter.rect_filled(fill, 2.0, accent);
+}
+
+fn draw_codex_usage_card(ui: &mut egui::Ui, state: &CodexUsageState) {
+    let available_width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(available_width, 194.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    painter.rect_filled(rect, 12.0, CARD_BG);
+    painter.rect_stroke(
+        rect,
+        12.0,
+        Stroke::new(1.0, CARD_STROKE),
+        StrokeKind::Inside,
     );
+
+    let inner = rect.shrink2(Vec2::new(15.0, 12.0));
+
+    painter.text(
+        inner.left_top(),
+        Align2::LEFT_TOP,
+        "Codex 使用量",
+        FontId::proportional(14.0),
+        TEXT_MAIN,
+    );
+    painter.text(
+        Pos2::new(inner.right(), inner.top() + 1.0),
+        Align2::RIGHT_TOP,
+        state.status.label(),
+        FontId::proportional(10.0),
+        status_color(state.status),
+    );
+
+    let links_height = 24.0;
+    let links_rect = Rect::from_min_max(
+        Pos2::new(inner.left(), inner.bottom() - links_height),
+        inner.right_bottom(),
+    );
+    let content_rect = Rect::from_min_max(
+        Pos2::new(inner.left(), inner.top() + 31.0),
+        Pos2::new(inner.right(), links_rect.top() - 7.0),
+    );
+
+    ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
+        ui.set_clip_rect(content_rect);
+        ui.set_width(content_rect.width());
+        draw_codex_usage_content(ui, state.content.as_ref());
+    });
+
+    ui.scope_builder(egui::UiBuilder::new().max_rect(links_rect), |ui| {
+        ui.set_clip_rect(links_rect);
+        ui.set_width(links_rect.width());
+        ui.add_space(3.0);
+        draw_codex_links(ui);
+    });
+}
+
+fn draw_codex_usage_content(ui: &mut egui::Ui, content: Option<&CodexUsageContent>) {
+    ui.columns(2, |columns| match content {
+        Some(content) => {
+            draw_quota_section(
+                &mut columns[0],
+                Some(&content.codex),
+                "Codex",
+                None,
+                CODEX_ACCENT,
+            );
+            draw_quota_section(
+                &mut columns[1],
+                content.spark.as_ref(),
+                "Spark",
+                Some("未検出"),
+                SPARK_ACCENT,
+            );
+        }
+        None => {
+            draw_quota_section(&mut columns[0], None, "Codex", Some("未取得"), CODEX_ACCENT);
+            draw_quota_section(&mut columns[1], None, "Spark", Some("未検出"), SPARK_ACCENT);
+        }
+    });
+}
+
+fn draw_quota_section(
+    ui: &mut egui::Ui,
+    bucket: Option<&QuotaBucket>,
+    title: &str,
+    missing_label: Option<&str>,
+    accent: Color32,
+) {
+    ui.set_width(ui.available_width());
+
+    ui.horizontal(|ui| {
+        let section_title = bucket.map(|bucket| bucket.title.as_str()).unwrap_or(title);
+        ui.label(
+            RichText::new(section_title)
+                .size(13.0)
+                .strong()
+                .color(TEXT_MAIN),
+        );
+        if bucket.is_none() {
+            ui.label(
+                RichText::new(missing_label.unwrap_or("--"))
+                    .size(11.0)
+                    .color(TEXT_SUBTLE),
+            );
+        }
+    });
+
+    ui.add_space(7.0);
+
+    if let Some(bucket) = bucket {
+        draw_quota_window_row(ui, &bucket.five_hour, accent);
+        ui.add_space(5.0);
+        draw_quota_window_row(ui, &bucket.weekly, accent);
+    } else {
+        draw_empty_quota_window_row(ui, "5h");
+        ui.add_space(5.0);
+        draw_empty_quota_window_row(ui, "週");
+    }
+}
+
+fn draw_quota_window_row(ui: &mut egui::Ui, window: &QuotaWindow, accent: Color32) {
+    draw_quota_row(
+        ui,
+        window.label,
+        &window.remaining_text(),
+        &window.reset_text,
+        accent,
+    );
+}
+
+fn draw_empty_quota_window_row(ui: &mut egui::Ui, label: &'static str) {
+    draw_quota_row(ui, label, "--", "--", TEXT_SUBTLE);
+}
+
+fn draw_quota_row(
+    ui: &mut egui::Ui,
+    label: &'static str,
+    remaining: &str,
+    reset: &str,
+    accent: Color32,
+) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let left = rect.left() + 1.0;
+    let center_y = rect.center().y;
+
+    painter.text(
+        Pos2::new(left, center_y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(11.0),
+        TEXT_MUTED,
+    );
+    painter.text(
+        Pos2::new(left + 28.0, center_y - 1.0),
+        Align2::LEFT_CENTER,
+        remaining,
+        FontId::proportional(21.0),
+        TEXT_MAIN,
+    );
+    painter.text(
+        Pos2::new(left + 78.0, center_y + 4.0),
+        Align2::LEFT_CENTER,
+        "残",
+        FontId::proportional(10.0),
+        accent,
+    );
+    painter.text(
+        Pos2::new(rect.right() - 2.0, center_y),
+        Align2::RIGHT_CENTER,
+        compact_text(reset, 12),
+        FontId::proportional(10.0),
+        TEXT_MUTED,
+    );
+}
+
+fn status_color(status: CodexUsageStatus) -> Color32 {
+    match status {
+        CodexUsageStatus::Loading => TEXT_SUBTLE,
+        CodexUsageStatus::Ready => ACCENT_GREEN,
+        CodexUsageStatus::Stale => WARNING_AMBER,
+        CodexUsageStatus::Unavailable => ERROR_RED,
+    }
+}
+
+fn draw_codex_links(ui: &mut egui::Ui) {
+    ui.horizontal_centered(|ui| {
+        ui.hyperlink_to(
+            RichText::new("使用状況を開く")
+                .size(12.0)
+                .strong()
+                .underline()
+                .color(CODEX_ACCENT),
+            "https://chatgpt.com/codex/settings/usage",
+        );
+        ui.label(RichText::new(" / ").size(10.0).color(TEXT_SUBTLE));
+        ui.hyperlink_to(
+            RichText::new("Status page")
+                .size(12.0)
+                .strong()
+                .underline()
+                .color(CODEX_ACCENT),
+            "https://status.openai.com",
+        );
+    });
 }
 
 fn cpu_detail(snapshot: &Snapshot) -> String {
