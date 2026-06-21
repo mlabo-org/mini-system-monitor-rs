@@ -13,12 +13,16 @@ use codex_usage::{
     QuotaWindow,
 };
 use eframe::egui::{
-    self, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect, RichText,
-    Sense, Stroke, StrokeKind, TextStyle, Vec2,
+    self, Align2, Color32, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect,
+    RichText, Sense, Stroke, StrokeKind, TextStyle, Vec2,
 };
 use metrics::{MetricsSampler, Snapshot};
 
 const APP_TITLE: &str = "システムモニター";
+const FULL_WINDOW_SIZE: [f32; 2] = [420.0, 430.0];
+const FULL_MIN_WINDOW_SIZE: [f32; 2] = [390.0, 410.0];
+const COMPACT_WINDOW_SIZE: [f32; 2] = [420.0, 170.0];
+const COMPACT_MIN_WINDOW_SIZE: [f32; 2] = [360.0, 150.0];
 const JAPANESE_FONT_NAME: &str = "system_japanese";
 const JAPANESE_FONT_PATHS: &[&str] = &[
     "/System/Library/Fonts/Hiragino Sans.ttc",
@@ -91,10 +95,10 @@ impl Palette {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 430.0])
-            .with_min_inner_size([390.0, 410.0])
+            .with_inner_size(FULL_WINDOW_SIZE)
+            .with_min_inner_size(FULL_MIN_WINDOW_SIZE)
             .with_resizable(false)
-            .with_transparent(true)
+            .with_transparent(false)
             .with_window_level(egui::WindowLevel::AlwaysOnTop),
         ..Default::default()
     };
@@ -112,6 +116,45 @@ struct MonitorApp {
     last_update: Instant,
     codex_usage: CodexUsageState,
     codex_rx: Receiver<CodexUsageState>,
+    display_mode: DisplayMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DisplayMode {
+    Full,
+    Compact,
+}
+
+impl DisplayMode {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Full => Self::Compact,
+            Self::Compact => Self::Full,
+        }
+    }
+
+    fn size(self) -> Vec2 {
+        let [width, height] = match self {
+            Self::Full => FULL_WINDOW_SIZE,
+            Self::Compact => COMPACT_WINDOW_SIZE,
+        };
+        Vec2::new(width, height)
+    }
+
+    fn min_size(self) -> Vec2 {
+        let [width, height] = match self {
+            Self::Full => FULL_MIN_WINDOW_SIZE,
+            Self::Compact => COMPACT_MIN_WINDOW_SIZE,
+        };
+        Vec2::new(width, height)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Full => "Full",
+            Self::Compact => "Compact",
+        }
+    }
 }
 
 impl MonitorApp {
@@ -128,6 +171,7 @@ impl MonitorApp {
             last_update: Instant::now(),
             codex_usage: CodexUsageState::loading(),
             codex_rx,
+            display_mode: DisplayMode::Full,
         }
     }
 
@@ -146,6 +190,16 @@ impl MonitorApp {
 }
 
 impl eframe::App for MonitorApp {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        let theme = if visuals.dark_mode {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        };
+
+        Palette::for_theme(theme).panel_bg.to_normalized_gamma_f32()
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_latest_snapshot();
         self.receive_latest_codex_usage();
@@ -154,29 +208,100 @@ impl eframe::App for MonitorApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let palette = Palette::for_theme(ui.ctx().theme());
-        let rect = ui.max_rect().shrink2(Vec2::new(8.0, 7.0));
+        let rect = ui.max_rect();
         let painter = ui.painter();
-        painter.rect_filled(rect, 15.0, palette.panel_bg);
-        painter.rect_stroke(
-            rect,
-            15.0,
-            Stroke::new(1.0, palette.panel_stroke),
-            StrokeKind::Inside,
-        );
 
-        ui.scope_builder(
-            egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(18.0, 15.0))),
-            |ui| {
-                draw_header(ui, self.last_update, palette);
+        painter.rect_filled(rect, 0.0, palette.panel_bg);
 
-                ui.add_space(13.0);
-                draw_system_card(ui, &self.snapshot, palette);
+        let content_rect = rect.shrink2(Vec2::new(18.0, 15.0));
+        let mut should_toggle_mode = draw_surface_toggle_targets(ui, rect, content_rect);
 
-                ui.add_space(10.0);
-                draw_codex_usage_card(ui, &self.codex_usage, palette);
-            },
-        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
+            should_toggle_mode |= draw_header(ui, self.last_update, self.display_mode, palette);
+
+            match self.display_mode {
+                DisplayMode::Full => {
+                    should_toggle_mode |= draw_toggle_space(ui, 13.0);
+                    draw_system_card(ui, &self.snapshot, palette);
+
+                    should_toggle_mode |= draw_toggle_space(ui, 10.0);
+                    draw_codex_usage_card(ui, &self.codex_usage, palette);
+                }
+                DisplayMode::Compact => {
+                    should_toggle_mode |= draw_toggle_space(ui, 11.0);
+                    draw_compact_card(ui, &self.snapshot, &self.codex_usage, palette);
+                }
+            }
+
+            should_toggle_mode |= draw_remaining_toggle_space(ui);
+        });
+
+        if should_toggle_mode {
+            self.display_mode = self.display_mode.toggled();
+            apply_display_mode_size(ui.ctx(), self.display_mode);
+        }
     }
+}
+
+fn apply_display_mode_size(ctx: &egui::Context, display_mode: DisplayMode) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(display_mode.min_size()));
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(display_mode.size()));
+}
+
+fn draw_surface_toggle_targets(ui: &mut egui::Ui, rect: Rect, content_rect: Rect) -> bool {
+    [
+        (
+            "surface_toggle_top",
+            Rect::from_min_max(rect.left_top(), Pos2::new(rect.right(), content_rect.top())),
+        ),
+        (
+            "surface_toggle_bottom",
+            Rect::from_min_max(
+                Pos2::new(rect.left(), content_rect.bottom()),
+                rect.right_bottom(),
+            ),
+        ),
+        (
+            "surface_toggle_left",
+            Rect::from_min_max(
+                Pos2::new(rect.left(), content_rect.top()),
+                Pos2::new(content_rect.left(), content_rect.bottom()),
+            ),
+        ),
+        (
+            "surface_toggle_right",
+            Rect::from_min_max(
+                Pos2::new(content_rect.right(), content_rect.top()),
+                Pos2::new(rect.right(), content_rect.bottom()),
+            ),
+        ),
+    ]
+    .into_iter()
+    .any(|(id_source, target_rect)| {
+        ui.interact(
+            target_rect,
+            ui.make_persistent_id(id_source),
+            Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .clicked()
+    })
+}
+
+fn draw_toggle_space(ui: &mut egui::Ui, height: f32) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
+    ui.painter().rect_filled(rect, 0.0, Color32::TRANSPARENT);
+    response.on_hover_cursor(CursorIcon::PointingHand).clicked()
+}
+
+fn draw_remaining_toggle_space(ui: &mut egui::Ui) -> bool {
+    let height = ui.available_height();
+    if !height.is_finite() || height <= 0.0 {
+        return false;
+    }
+
+    draw_toggle_space(ui, height)
 }
 
 fn register_japanese_font(ctx: &egui::Context) {
@@ -281,26 +406,54 @@ fn start_codex_usage_sampler() -> Receiver<CodexUsageState> {
     rx
 }
 
-fn draw_header(ui: &mut egui::Ui, last_update: Instant, palette: Palette) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(APP_TITLE)
-                .size(18.0)
-                .strong()
-                .color(palette.text_main),
-        );
+fn draw_header(
+    ui: &mut egui::Ui,
+    last_update: Instant,
+    display_mode: DisplayMode,
+    palette: Palette,
+) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::click());
+    let response = response.on_hover_cursor(CursorIcon::PointingHand);
+    let painter = ui.painter_at(rect);
+    let center_y = rect.center().y;
+    let age = last_update.elapsed().as_secs_f32();
+    let live_color = if age < 1.8 {
+        palette.accent_green
+    } else {
+        palette.text_muted
+    };
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let age = last_update.elapsed().as_secs_f32();
-            let color = if age < 1.8 {
-                palette.accent_green
-            } else {
-                palette.text_muted
-            };
-            ui.label(RichText::new("●").size(11.0).color(color));
-            ui.label(RichText::new("LIVE").size(10.0).color(palette.text_subtle));
-        });
-    });
+    painter.text(
+        Pos2::new(rect.left(), center_y),
+        Align2::LEFT_CENTER,
+        APP_TITLE,
+        FontId::proportional(18.0),
+        palette.text_main,
+    );
+    painter.text(
+        Pos2::new(rect.right(), center_y),
+        Align2::RIGHT_CENTER,
+        "LIVE",
+        FontId::proportional(10.0),
+        palette.text_subtle,
+    );
+    painter.text(
+        Pos2::new(rect.right() - 29.0, center_y - 0.5),
+        Align2::RIGHT_CENTER,
+        "●",
+        FontId::proportional(11.0),
+        live_color,
+    );
+    painter.text(
+        Pos2::new(rect.right() - 46.0, center_y),
+        Align2::RIGHT_CENTER,
+        display_mode.label(),
+        FontId::proportional(10.0),
+        palette.text_subtle,
+    );
+
+    response.clicked()
 }
 
 fn draw_system_card(ui: &mut egui::Ui, snapshot: &Snapshot, palette: Palette) {
@@ -380,6 +533,117 @@ fn draw_system_card(ui: &mut egui::Ui, snapshot: &Snapshot, palette: Palette) {
         },
         palette,
     );
+}
+
+fn draw_compact_card(
+    ui: &mut egui::Ui,
+    snapshot: &Snapshot,
+    state: &CodexUsageState,
+    palette: Palette,
+) {
+    let available_width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(available_width, 82.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    painter.rect_filled(rect, 12.0, palette.card_bg);
+    painter.rect_stroke(
+        rect,
+        12.0,
+        Stroke::new(1.0, palette.card_stroke),
+        StrokeKind::Inside,
+    );
+
+    let inner = rect.shrink2(Vec2::new(15.0, 13.0));
+    let column_gap = 14.0;
+    let column_width = (inner.width() - column_gap * 2.0) / 3.0;
+    let cpu_rect = Rect::from_min_size(inner.left_top(), Vec2::new(column_width, inner.height()));
+    let memory_rect = Rect::from_min_size(
+        Pos2::new(cpu_rect.right() + column_gap, inner.top()),
+        Vec2::new(column_width, inner.height()),
+    );
+    let codex_rect = Rect::from_min_size(
+        Pos2::new(memory_rect.right() + column_gap, inner.top()),
+        Vec2::new(column_width, inner.height()),
+    );
+
+    draw_compact_metric(
+        &painter,
+        cpu_rect,
+        CompactMetricDisplay {
+            title: "CPU",
+            value: format!("{:.0}%", snapshot.cpu_percent.clamp(0.0, 100.0)),
+            detail: cpu_detail(snapshot),
+            percent: snapshot.cpu_percent,
+            accent: palette.accent_green,
+        },
+        palette,
+    );
+    draw_compact_metric(
+        &painter,
+        memory_rect,
+        CompactMetricDisplay {
+            title: "Mem",
+            value: format!("{:.0}%", snapshot.memory_percent.clamp(0.0, 100.0)),
+            detail: format!(
+                "{:.1}/{:.1} GiB",
+                snapshot.memory_used_gib, snapshot.memory_total_gib
+            ),
+            percent: snapshot.memory_percent,
+            accent: palette.codex_accent,
+        },
+        palette,
+    );
+    draw_compact_metric(
+        &painter,
+        codex_rect,
+        CompactMetricDisplay {
+            title: "Codex",
+            value: state.status.label().to_owned(),
+            detail: codex_compact_detail(state),
+            percent: codex_compact_percent(state),
+            accent: status_color(state.status, palette),
+        },
+        palette,
+    );
+}
+
+struct CompactMetricDisplay {
+    title: &'static str,
+    value: String,
+    detail: String,
+    percent: f32,
+    accent: Color32,
+}
+
+fn draw_compact_metric(
+    painter: &egui::Painter,
+    rect: Rect,
+    metric: CompactMetricDisplay,
+    palette: Palette,
+) {
+    painter.text(
+        rect.left_top(),
+        Align2::LEFT_TOP,
+        metric.title,
+        FontId::proportional(10.0),
+        palette.text_muted,
+    );
+    painter.text(
+        Pos2::new(rect.left(), rect.top() + 18.0),
+        Align2::LEFT_TOP,
+        compact_text(&metric.value, 9),
+        FontId::proportional(18.0),
+        palette.text_main,
+    );
+    painter.text(
+        Pos2::new(rect.left(), rect.top() + 43.0),
+        Align2::LEFT_TOP,
+        compact_text(&metric.detail, 14),
+        FontId::proportional(9.5),
+        palette.text_subtle,
+    );
+
+    draw_metric_track(painter, rect, metric.percent, metric.accent, palette);
 }
 
 struct SystemMetricDisplay {
@@ -642,6 +906,35 @@ fn draw_quota_row(
         FontId::proportional(10.0),
         palette.text_muted,
     );
+}
+
+fn codex_compact_detail(state: &CodexUsageState) -> String {
+    state
+        .content
+        .as_ref()
+        .map(|content| {
+            format!(
+                "5h {} / 週 {}",
+                content.codex.five_hour.remaining_text(),
+                content.codex.weekly.remaining_text()
+            )
+        })
+        .unwrap_or_else(|| "使用量 --".to_owned())
+}
+
+fn codex_compact_percent(state: &CodexUsageState) -> f32 {
+    state
+        .content
+        .as_ref()
+        .and_then(|content| {
+            content
+                .codex
+                .five_hour
+                .remaining_percent
+                .or(content.codex.weekly.remaining_percent)
+        })
+        .map(f32::from)
+        .unwrap_or(0.0)
 }
 
 fn status_color(status: CodexUsageStatus, palette: Palette) -> Color32 {
