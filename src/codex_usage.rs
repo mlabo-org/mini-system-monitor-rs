@@ -1,6 +1,10 @@
 use std::{
     collections::BTreeMap,
+    env,
+    ffi::OsStr,
+    fs,
     io::{self, BufRead, BufReader, Write},
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc::{self, Receiver},
     thread::{self, JoinHandle},
@@ -12,6 +16,8 @@ use serde_json::{Value, json};
 
 const CODEX_COMMAND: &str = "codex";
 const APP_SERVER_ARG: &str = "app-server";
+const USER_LOCAL_CODEX: &str = "/Users/suzukimakoto/.local/bin/codex";
+const CODEX_APP_BUNDLED_CLI: &str = "/Applications/Codex.app/Contents/Resources/codex";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
@@ -177,7 +183,8 @@ struct JsonRpcClient {
 
 impl JsonRpcClient {
     fn spawn() -> Result<Self, FetchError> {
-        let mut child = Command::new(CODEX_COMMAND)
+        let codex_executable = resolve_codex_executable();
+        let mut child = Command::new(codex_executable)
             .arg(APP_SERVER_ARG)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -284,6 +291,82 @@ impl JsonRpcClient {
                 .cloned()
                 .ok_or(FetchError::BadResponse("missing result"));
         }
+    }
+}
+
+fn resolve_codex_executable() -> PathBuf {
+    resolve_codex_executable_from(
+        env::var_os("PATH").as_deref(),
+        env::var_os("HOME").as_deref(),
+    )
+}
+
+fn resolve_codex_executable_from(path_env: Option<&OsStr>, home: Option<&OsStr>) -> PathBuf {
+    resolve_codex_executable_with_fixed_candidates(
+        path_env,
+        home,
+        [
+            Path::new(USER_LOCAL_CODEX),
+            Path::new(CODEX_APP_BUNDLED_CLI),
+        ],
+    )
+}
+
+fn resolve_codex_executable_with_fixed_candidates<'a>(
+    path_env: Option<&OsStr>,
+    home: Option<&OsStr>,
+    fixed_candidates: impl IntoIterator<Item = &'a Path>,
+) -> PathBuf {
+    codex_executable_candidates(path_env, home, fixed_candidates)
+        .into_iter()
+        .find(|candidate| is_executable_file(candidate))
+        .unwrap_or_else(|| PathBuf::from(CODEX_COMMAND))
+}
+
+fn codex_executable_candidates<'a>(
+    path_env: Option<&OsStr>,
+    home: Option<&OsStr>,
+    fixed_candidates: impl IntoIterator<Item = &'a Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(path_env) = path_env {
+        candidates.extend(
+            env::split_paths(path_env)
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| path.join(CODEX_COMMAND)),
+        );
+    }
+
+    if let Some(home) = home
+        && !home.is_empty()
+    {
+        candidates.push(Path::new(home).join(".local/bin/codex"));
+    }
+
+    candidates.extend(fixed_candidates.into_iter().map(Path::to_path_buf));
+    candidates
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
@@ -507,6 +590,33 @@ fn unix_seconds(time: SystemTime) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "mini-system-monitor-rs-{name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn write_executable(path: &Path) {
+        fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write executable");
+
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(path)
+                .expect("executable metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("set executable permissions");
+        }
+    }
 
     #[test]
     fn parses_codex_and_spark_buckets_from_limit_id_map() {
@@ -580,5 +690,51 @@ mod tests {
         assert_eq!(format_reset_countdown(Some(182_800), 10_000), "あと2日");
         assert_eq!(format_reset_countdown(Some(9_999), 10_000), "まもなく");
         assert_eq!(format_reset_countdown(None, 10_000), "--");
+    }
+
+    #[test]
+    fn resolves_codex_from_path_when_available() {
+        let dir = unique_temp_dir("path-codex");
+        fs::create_dir_all(&dir).expect("create temp bin");
+        let codex = dir.join(CODEX_COMMAND);
+        write_executable(&codex);
+
+        let path_env = OsString::from(dir.as_os_str());
+        let resolved = resolve_codex_executable_from(Some(path_env.as_os_str()), None);
+
+        assert_eq!(resolved, codex);
+
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn resolves_codex_from_home_local_bin_with_empty_path() {
+        let home = unique_temp_dir("home-codex");
+        let local_bin = home.join(".local/bin");
+        fs::create_dir_all(&local_bin).expect("create home local bin");
+        let codex = local_bin.join(CODEX_COMMAND);
+        write_executable(&codex);
+
+        let empty_path = OsString::from("");
+        let resolved =
+            resolve_codex_executable_from(Some(empty_path.as_os_str()), Some(home.as_os_str()));
+
+        assert_eq!(resolved, codex);
+
+        fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn falls_back_to_command_name_when_no_candidate_exists() {
+        let home = unique_temp_dir("missing-codex");
+        let minimal_path = OsString::from("/usr/bin:/bin:/usr/sbin:/sbin");
+
+        let resolved = resolve_codex_executable_with_fixed_candidates(
+            Some(minimal_path.as_os_str()),
+            Some(home.as_os_str()),
+            [],
+        );
+
+        assert_eq!(resolved, PathBuf::from(CODEX_COMMAND));
     }
 }
