@@ -598,7 +598,7 @@ fn draw_compact_card(
         codex_rect,
         CompactMetricDisplay {
             title: "Codex",
-            value: state.status.label().to_owned(),
+            value: codex_compact_value(state),
             detail: codex_compact_detail(state),
             percent: codex_compact_percent(state),
             accent: status_color(state.status, palette),
@@ -912,14 +912,19 @@ fn codex_compact_detail(state: &CodexUsageState) -> String {
     state
         .content
         .as_ref()
-        .map(|content| {
-            format!(
-                "5h {} / 週 {}",
-                content.codex.five_hour.remaining_text(),
-                content.codex.weekly.remaining_text()
-            )
-        })
+        .map(|content| format!("週 {}残", content.codex.weekly.remaining_text()))
         .unwrap_or_else(|| "使用量 --".to_owned())
+}
+
+fn codex_compact_value(state: &CodexUsageState) -> String {
+    state
+        .content
+        .as_ref()
+        .map(|content| format!("5h {}残", content.codex.five_hour.remaining_text()))
+        .unwrap_or_else(|| match state.status {
+            CodexUsageStatus::Ready => "--".to_owned(),
+            status => status.label().to_owned(),
+        })
 }
 
 fn codex_compact_percent(state: &CodexUsageState) -> f32 {
