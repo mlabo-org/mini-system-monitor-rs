@@ -2,7 +2,8 @@ mod codex_usage;
 mod metrics;
 
 use std::{
-    fs,
+    env, fs,
+    process::Command,
     sync::mpsc::{self, Receiver},
     thread,
     time::{Duration, Instant},
@@ -17,8 +18,10 @@ use eframe::egui::{
     RichText, Sense, Stroke, StrokeKind, TextStyle, Vec2,
 };
 use metrics::{MetricsSampler, Snapshot};
+use serde::{Deserialize, Serialize};
 
 const APP_TITLE: &str = "システムモニター";
+const PREFERENCES_STORAGE_KEY: &str = "mini-system-monitor-rs.ui-preferences.v1";
 const FULL_WINDOW_SIZE: [f32; 2] = [420.0, 430.0];
 const FULL_MIN_WINDOW_SIZE: [f32; 2] = [390.0, 410.0];
 const COMPACT_WINDOW_SIZE: [f32; 2] = [420.0, 170.0];
@@ -34,6 +37,90 @@ const JAPANESE_FONT_PATHS: &[&str] = &[
     "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
     "/Library/Fonts/Osaka.ttf",
 ];
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum LanguageChoice {
+    #[default]
+    System,
+    Ja,
+    En,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ThemeChoice {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemeChoice {
+    fn egui_preference(self) -> egui::ThemePreference {
+        match self {
+            Self::System => egui::ThemePreference::System,
+            Self::Light => egui::ThemePreference::Light,
+            Self::Dark => egui::ThemePreference::Dark,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct UiPreferences {
+    language: LanguageChoice,
+    theme: ThemeChoice,
+}
+
+impl UiPreferences {
+    fn from_json(json: &str) -> Option<Self> {
+        serde_json::from_str(json).ok()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Language {
+    Japanese,
+    English,
+}
+
+impl LanguageChoice {
+    fn resolve(self, system_language: Language) -> Language {
+        match self {
+            Self::System => system_language,
+            Self::Ja => Language::Japanese,
+            Self::En => Language::English,
+        }
+    }
+}
+
+fn language_from_locale(locale: &str) -> Option<Language> {
+    locale
+        .split(|character: char| !character.is_ascii_alphabetic())
+        .find(|part| !part.is_empty())
+        .and_then(|code| match code.to_ascii_lowercase().as_str() {
+            "ja" => Some(Language::Japanese),
+            "en" => Some(Language::English),
+            _ => None,
+        })
+}
+
+fn detect_system_language() -> Language {
+    ["LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .filter_map(|name| env::var(name).ok())
+        .find_map(|locale| language_from_locale(&locale))
+        .or_else(|| {
+            Command::new("defaults")
+                .args(["read", "-g", "AppleLanguages"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|locale| language_from_locale(&locale))
+        })
+        .unwrap_or(Language::Japanese)
+}
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -117,6 +204,8 @@ struct MonitorApp {
     codex_usage: CodexUsageState,
     codex_rx: Receiver<CodexUsageState>,
     display_mode: DisplayMode,
+    preferences: UiPreferences,
+    system_language: Language,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,10 +238,12 @@ impl DisplayMode {
         Vec2::new(width, height)
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Full => "Full",
-            Self::Compact => "Compact",
+    fn label(self, language: Language) -> &'static str {
+        match (self, language) {
+            (Self::Full, Language::Japanese) => "標準",
+            (Self::Compact, Language::Japanese) => "コンパクト",
+            (Self::Full, Language::English) => "Full",
+            (Self::Compact, Language::English) => "Compact",
         }
     }
 }
@@ -161,6 +252,15 @@ impl MonitorApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         register_japanese_font(&cc.egui_ctx);
         configure_style(&cc.egui_ctx);
+
+        let system_language = detect_system_language();
+        let preferences = cc
+            .storage
+            .and_then(|storage| storage.get_string(PREFERENCES_STORAGE_KEY))
+            .as_deref()
+            .and_then(UiPreferences::from_json)
+            .unwrap_or_default();
+        apply_preferences(&cc.egui_ctx, preferences, system_language);
 
         let (snapshot, rx) = start_metrics_sampler();
         let codex_rx = start_codex_usage_sampler();
@@ -172,6 +272,8 @@ impl MonitorApp {
             codex_usage: CodexUsageState::loading(),
             codex_rx,
             display_mode: DisplayMode::Full,
+            preferences,
+            system_language,
         }
     }
 
@@ -190,6 +292,12 @@ impl MonitorApp {
 }
 
 impl eframe::App for MonitorApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if let Ok(json) = serde_json::to_string(&self.preferences) {
+            storage.set_string(PREFERENCES_STORAGE_KEY, json);
+        }
+    }
+
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         let theme = if visuals.dark_mode {
             egui::Theme::Dark
@@ -207,6 +315,7 @@ impl eframe::App for MonitorApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let language = self.preferences.language.resolve(self.system_language);
         let palette = Palette::for_theme(ui.ctx().theme());
         let rect = ui.max_rect();
         let painter = ui.painter();
@@ -217,20 +326,25 @@ impl eframe::App for MonitorApp {
         let mut should_toggle_mode = draw_surface_toggle_targets(ui, rect, content_rect);
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
-            should_toggle_mode |= draw_header(ui, self.last_update, self.display_mode, palette);
+            should_toggle_mode |=
+                draw_header(ui, self.last_update, self.display_mode, language, palette);
 
             match self.display_mode {
                 DisplayMode::Full => {
                     should_toggle_mode |= draw_toggle_space(ui, 13.0);
-                    draw_system_card(ui, &self.snapshot, palette);
+                    draw_system_card(ui, &self.snapshot, language, palette);
 
                     should_toggle_mode |= draw_toggle_space(ui, 10.0);
-                    draw_codex_usage_card(ui, &self.codex_usage, palette);
+                    draw_codex_usage_card(ui, &self.codex_usage, language, palette);
                 }
                 DisplayMode::Compact => {
                     should_toggle_mode |= draw_toggle_space(ui, 11.0);
-                    draw_compact_card(ui, &self.snapshot, &self.codex_usage, palette);
+                    draw_compact_card(ui, &self.snapshot, &self.codex_usage, language, palette);
                 }
+            }
+
+            if draw_preferences(ui, &mut self.preferences, language) {
+                apply_preferences(ui.ctx(), self.preferences, self.system_language);
             }
 
             should_toggle_mode |= draw_remaining_toggle_space(ui);
@@ -240,6 +354,89 @@ impl eframe::App for MonitorApp {
             self.display_mode = self.display_mode.toggled();
             apply_display_mode_size(ui.ctx(), self.display_mode);
         }
+    }
+}
+
+fn apply_preferences(ctx: &egui::Context, preferences: UiPreferences, system_language: Language) {
+    ctx.set_theme(preferences.theme.egui_preference());
+    let title = match preferences.language.resolve(system_language) {
+        Language::Japanese => APP_TITLE,
+        Language::English => "System Monitor",
+    };
+    ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.to_owned()));
+}
+
+fn draw_preferences(
+    ui: &mut egui::Ui,
+    preferences: &mut UiPreferences,
+    language: Language,
+) -> bool {
+    let previous = *preferences;
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(4.0, 2.0);
+        ui.spacing_mut().button_padding = Vec2::new(6.0, 1.0);
+        ui.horizontal(|ui| {
+            ui.label(match language {
+                Language::Japanese => "言語",
+                Language::English => "Language",
+            });
+            egui::ComboBox::from_id_salt("language_preference")
+                .width(74.0)
+                .selected_text(language_choice_label(preferences.language, language))
+                .show_ui(ui, |ui| {
+                    for choice in [
+                        LanguageChoice::Ja,
+                        LanguageChoice::En,
+                        LanguageChoice::System,
+                    ] {
+                        ui.selectable_value(
+                            &mut preferences.language,
+                            choice,
+                            language_choice_label(choice, language),
+                        );
+                    }
+                });
+
+            ui.label(match language {
+                Language::Japanese => "テーマ",
+                Language::English => "Theme",
+            });
+            egui::ComboBox::from_id_salt("theme_preference")
+                .width(70.0)
+                .selected_text(theme_choice_label(preferences.theme, language))
+                .show_ui(ui, |ui| {
+                    for choice in [ThemeChoice::Light, ThemeChoice::Dark, ThemeChoice::System] {
+                        ui.selectable_value(
+                            &mut preferences.theme,
+                            choice,
+                            theme_choice_label(choice, language),
+                        );
+                    }
+                });
+        });
+    });
+    *preferences != previous
+}
+
+fn language_choice_label(choice: LanguageChoice, language: Language) -> &'static str {
+    match (choice, language) {
+        (LanguageChoice::Ja, Language::Japanese) => "日本語",
+        (LanguageChoice::En, Language::Japanese) => "英語",
+        (LanguageChoice::System, Language::Japanese) => "システム",
+        (LanguageChoice::Ja, Language::English) => "Japanese",
+        (LanguageChoice::En, Language::English) => "English",
+        (LanguageChoice::System, Language::English) => "System",
+    }
+}
+
+fn theme_choice_label(choice: ThemeChoice, language: Language) -> &'static str {
+    match (choice, language) {
+        (ThemeChoice::Light, Language::Japanese) => "ライト",
+        (ThemeChoice::Dark, Language::Japanese) => "ダーク",
+        (ThemeChoice::System, Language::Japanese) => "システム",
+        (ThemeChoice::Light, Language::English) => "Light",
+        (ThemeChoice::Dark, Language::English) => "Dark",
+        (ThemeChoice::System, Language::English) => "System",
     }
 }
 
@@ -410,6 +607,7 @@ fn draw_header(
     ui: &mut egui::Ui,
     last_update: Instant,
     display_mode: DisplayMode,
+    language: Language,
     palette: Palette,
 ) -> bool {
     let (rect, response) =
@@ -427,14 +625,20 @@ fn draw_header(
     painter.text(
         Pos2::new(rect.left(), center_y),
         Align2::LEFT_CENTER,
-        APP_TITLE,
+        match language {
+            Language::Japanese => APP_TITLE,
+            Language::English => "System Monitor",
+        },
         FontId::proportional(18.0),
         palette.text_main,
     );
     painter.text(
         Pos2::new(rect.right(), center_y),
         Align2::RIGHT_CENTER,
-        "LIVE",
+        match language {
+            Language::Japanese => "ライブ",
+            Language::English => "LIVE",
+        },
         FontId::proportional(10.0),
         palette.text_subtle,
     );
@@ -448,7 +652,7 @@ fn draw_header(
     painter.text(
         Pos2::new(rect.right() - 46.0, center_y),
         Align2::RIGHT_CENTER,
-        display_mode.label(),
+        display_mode.label(language),
         FontId::proportional(10.0),
         palette.text_subtle,
     );
@@ -456,7 +660,7 @@ fn draw_header(
     response.clicked()
 }
 
-fn draw_system_card(ui: &mut egui::Ui, snapshot: &Snapshot, palette: Palette) {
+fn draw_system_card(ui: &mut egui::Ui, snapshot: &Snapshot, language: Language, palette: Palette) {
     let available_width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(available_width, 112.0), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -473,14 +677,20 @@ fn draw_system_card(ui: &mut egui::Ui, snapshot: &Snapshot, palette: Palette) {
     painter.text(
         inner.left_top(),
         Align2::LEFT_TOP,
-        "System",
+        match language {
+            Language::Japanese => "システム",
+            Language::English => "System",
+        },
         FontId::proportional(14.0),
         palette.text_main,
     );
     painter.text(
         inner.right_top(),
         Align2::RIGHT_TOP,
-        "CPU / メモリ",
+        match language {
+            Language::Japanese => "CPU / メモリ",
+            Language::English => "CPU / Memory",
+        },
         FontId::proportional(10.0),
         palette.text_subtle,
     );
@@ -512,7 +722,7 @@ fn draw_system_card(ui: &mut egui::Ui, snapshot: &Snapshot, palette: Palette) {
         SystemMetricDisplay {
             title: "CPU",
             value: format!("{:.0}%", snapshot.cpu_percent.clamp(0.0, 100.0)),
-            detail: cpu_detail(snapshot),
+            detail: cpu_detail(snapshot, language),
             percent: snapshot.cpu_percent,
             accent: palette.accent_green,
         },
@@ -522,12 +732,22 @@ fn draw_system_card(ui: &mut egui::Ui, snapshot: &Snapshot, palette: Palette) {
         &painter,
         memory_rect,
         SystemMetricDisplay {
-            title: "メモリ",
+            title: match language {
+                Language::Japanese => "メモリ",
+                Language::English => "Memory",
+            },
             value: format!(
                 "{:.1}/{:.1} GiB",
                 snapshot.memory_used_gib, snapshot.memory_total_gib
             ),
-            detail: format!("使用率 {:.0}%", snapshot.memory_percent.clamp(0.0, 100.0)),
+            detail: match language {
+                Language::Japanese => {
+                    format!("使用率 {:.0}%", snapshot.memory_percent.clamp(0.0, 100.0))
+                }
+                Language::English => {
+                    format!("Used {:.0}%", snapshot.memory_percent.clamp(0.0, 100.0))
+                }
+            },
             percent: snapshot.memory_percent,
             accent: palette.codex_accent,
         },
@@ -539,6 +759,7 @@ fn draw_compact_card(
     ui: &mut egui::Ui,
     snapshot: &Snapshot,
     state: &CodexUsageState,
+    language: Language,
     palette: Palette,
 ) {
     let available_width = ui.available_width();
@@ -572,7 +793,7 @@ fn draw_compact_card(
         CompactMetricDisplay {
             title: "CPU",
             value: format!("{:.0}%", snapshot.cpu_percent.clamp(0.0, 100.0)),
-            detail: cpu_detail(snapshot),
+            detail: cpu_detail(snapshot, language),
             percent: snapshot.cpu_percent,
             accent: palette.accent_green,
         },
@@ -582,7 +803,10 @@ fn draw_compact_card(
         &painter,
         memory_rect,
         CompactMetricDisplay {
-            title: "Mem",
+            title: match language {
+                Language::Japanese => "メモリ",
+                Language::English => "Mem",
+            },
             value: format!("{:.0}%", snapshot.memory_percent.clamp(0.0, 100.0)),
             detail: format!(
                 "{:.1}/{:.1} GiB",
@@ -598,8 +822,8 @@ fn draw_compact_card(
         codex_rect,
         CompactMetricDisplay {
             title: "Codex",
-            value: codex_compact_value(state),
-            detail: codex_compact_detail(state),
+            value: codex_compact_value(state, language),
+            detail: codex_compact_detail(state, language),
             percent: codex_compact_percent(state),
             accent: status_color(state.status, palette),
         },
@@ -706,7 +930,12 @@ fn draw_metric_track(
     painter.rect_filled(fill, 2.0, accent);
 }
 
-fn draw_codex_usage_card(ui: &mut egui::Ui, state: &CodexUsageState, palette: Palette) {
+fn draw_codex_usage_card(
+    ui: &mut egui::Ui,
+    state: &CodexUsageState,
+    language: Language,
+    palette: Palette,
+) {
     let available_width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(available_width, 194.0), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -724,14 +953,17 @@ fn draw_codex_usage_card(ui: &mut egui::Ui, state: &CodexUsageState, palette: Pa
     painter.text(
         inner.left_top(),
         Align2::LEFT_TOP,
-        "Codex 使用量",
+        match language {
+            Language::Japanese => "Codex 使用量",
+            Language::English => "Codex usage",
+        },
         FontId::proportional(14.0),
         palette.text_main,
     );
     painter.text(
         Pos2::new(inner.right(), inner.top() + 1.0),
         Align2::RIGHT_TOP,
-        state.status.label(),
+        localized_status(state.status, language),
         FontId::proportional(10.0),
         status_color(state.status, palette),
     );
@@ -749,20 +981,21 @@ fn draw_codex_usage_card(ui: &mut egui::Ui, state: &CodexUsageState, palette: Pa
     ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
         ui.set_clip_rect(content_rect);
         ui.set_width(content_rect.width());
-        draw_codex_usage_content(ui, state.content.as_ref(), palette);
+        draw_codex_usage_content(ui, state.content.as_ref(), language, palette);
     });
 
     ui.scope_builder(egui::UiBuilder::new().max_rect(links_rect), |ui| {
         ui.set_clip_rect(links_rect);
         ui.set_width(links_rect.width());
         ui.add_space(3.0);
-        draw_codex_links(ui, palette);
+        draw_codex_links(ui, language, palette);
     });
 }
 
 fn draw_codex_usage_content(
     ui: &mut egui::Ui,
     content: Option<&CodexUsageContent>,
+    language: Language,
     palette: Palette,
 ) {
     ui.columns(2, |columns| match content {
@@ -772,6 +1005,7 @@ fn draw_codex_usage_content(
                 Some(&content.codex),
                 "Codex",
                 None,
+                language,
                 palette.codex_accent,
                 palette,
             );
@@ -779,7 +1013,11 @@ fn draw_codex_usage_content(
                 &mut columns[1],
                 content.spark.as_ref(),
                 "Spark",
-                Some("未検出"),
+                Some(match language {
+                    Language::Japanese => "未検出",
+                    Language::English => "Not detected",
+                }),
+                language,
                 palette.spark_accent,
                 palette,
             );
@@ -789,7 +1027,11 @@ fn draw_codex_usage_content(
                 &mut columns[0],
                 None,
                 "Codex",
-                Some("未取得"),
+                Some(match language {
+                    Language::Japanese => "未取得",
+                    Language::English => "Unavailable",
+                }),
+                language,
                 palette.codex_accent,
                 palette,
             );
@@ -797,7 +1039,11 @@ fn draw_codex_usage_content(
                 &mut columns[1],
                 None,
                 "Spark",
-                Some("未検出"),
+                Some(match language {
+                    Language::Japanese => "未検出",
+                    Language::English => "Not detected",
+                }),
+                language,
                 palette.spark_accent,
                 palette,
             );
@@ -810,6 +1056,7 @@ fn draw_quota_section(
     bucket: Option<&QuotaBucket>,
     title: &str,
     missing_label: Option<&str>,
+    language: Language,
     accent: Color32,
     palette: Palette,
 ) {
@@ -835,34 +1082,57 @@ fn draw_quota_section(
     ui.add_space(7.0);
 
     if let Some(bucket) = bucket {
-        draw_quota_window_row(ui, &bucket.five_hour, accent, palette);
+        draw_quota_window_row(ui, &bucket.five_hour, language, accent, palette);
         ui.add_space(5.0);
-        draw_quota_window_row(ui, &bucket.weekly, accent, palette);
+        draw_quota_window_row(ui, &bucket.weekly, language, accent, palette);
     } else {
-        draw_empty_quota_window_row(ui, "5h", palette);
+        draw_empty_quota_window_row(ui, "5h", language, palette);
         ui.add_space(5.0);
-        draw_empty_quota_window_row(ui, "週", palette);
+        draw_empty_quota_window_row(
+            ui,
+            match language {
+                Language::Japanese => "週",
+                Language::English => "Week",
+            },
+            language,
+            palette,
+        );
     }
 }
 
 fn draw_quota_window_row(
     ui: &mut egui::Ui,
     window: &QuotaWindow,
+    language: Language,
     accent: Color32,
     palette: Palette,
 ) {
     draw_quota_row(
         ui,
-        window.label,
+        localized_quota_label(window.label, language),
         &window.remaining_text(),
-        &window.reset_text,
+        &localized_reset_text(&window.reset_text, language),
+        language,
         accent,
         palette,
     );
 }
 
-fn draw_empty_quota_window_row(ui: &mut egui::Ui, label: &'static str, palette: Palette) {
-    draw_quota_row(ui, label, "--", "--", palette.text_subtle, palette);
+fn draw_empty_quota_window_row(
+    ui: &mut egui::Ui,
+    label: &'static str,
+    language: Language,
+    palette: Palette,
+) {
+    draw_quota_row(
+        ui,
+        label,
+        "--",
+        "--",
+        language,
+        palette.text_subtle,
+        palette,
+    );
 }
 
 fn draw_quota_row(
@@ -870,6 +1140,7 @@ fn draw_quota_row(
     label: &'static str,
     remaining: &str,
     reset: &str,
+    language: Language,
     accent: Color32,
     palette: Palette,
 ) {
@@ -895,7 +1166,10 @@ fn draw_quota_row(
     painter.text(
         Pos2::new(left + 78.0, center_y + 4.0),
         Align2::LEFT_CENTER,
-        "残",
+        match language {
+            Language::Japanese => "残",
+            Language::English => "left",
+        },
         FontId::proportional(10.0),
         accent,
     );
@@ -908,23 +1182,70 @@ fn draw_quota_row(
     );
 }
 
-fn codex_compact_detail(state: &CodexUsageState) -> String {
+fn codex_compact_detail(state: &CodexUsageState, language: Language) -> String {
     state
         .content
         .as_ref()
-        .map(|content| format!("週 {}残", content.codex.weekly.remaining_text()))
-        .unwrap_or_else(|| "使用量 --".to_owned())
+        .map(|content| match language {
+            Language::Japanese => format!("週 {}残", content.codex.weekly.remaining_text()),
+            Language::English => format!("Week {} left", content.codex.weekly.remaining_text()),
+        })
+        .unwrap_or_else(|| match language {
+            Language::Japanese => "使用量 --".to_owned(),
+            Language::English => "Usage --".to_owned(),
+        })
 }
 
-fn codex_compact_value(state: &CodexUsageState) -> String {
+fn codex_compact_value(state: &CodexUsageState, language: Language) -> String {
     state
         .content
         .as_ref()
-        .map(|content| format!("5h {}残", content.codex.five_hour.remaining_text()))
+        .map(|content| match language {
+            Language::Japanese => format!("5h {}残", content.codex.five_hour.remaining_text()),
+            Language::English => format!("5h {} left", content.codex.five_hour.remaining_text()),
+        })
         .unwrap_or_else(|| match state.status {
             CodexUsageStatus::Ready => "--".to_owned(),
-            status => status.label().to_owned(),
+            status => localized_status(status, language).to_owned(),
         })
+}
+
+fn localized_status(status: CodexUsageStatus, language: Language) -> &'static str {
+    match (status, language) {
+        (CodexUsageStatus::Loading, Language::Japanese) => "読込中",
+        (CodexUsageStatus::Ready, Language::Japanese) => "取得済み",
+        (CodexUsageStatus::Stale, Language::Japanese) => "更新待ち",
+        (CodexUsageStatus::Unavailable, Language::Japanese) => "オフライン",
+        (CodexUsageStatus::Loading, Language::English) => "LOADING",
+        (CodexUsageStatus::Ready, Language::English) => "READY",
+        (CodexUsageStatus::Stale, Language::English) => "STALE",
+        (CodexUsageStatus::Unavailable, Language::English) => "OFFLINE",
+    }
+}
+
+fn localized_quota_label(label: &'static str, language: Language) -> &'static str {
+    match (label, language) {
+        ("週", Language::English) => "Week",
+        _ => label,
+    }
+}
+
+fn localized_reset_text(reset: &str, language: Language) -> String {
+    if language == Language::Japanese || reset == "--" {
+        return reset.to_owned();
+    }
+    if reset == "まもなく" {
+        return "Soon".to_owned();
+    }
+
+    let translated = reset
+        .strip_prefix("あと")
+        .unwrap_or(reset)
+        .replace("1分未満", "<1m")
+        .replace('日', "d ")
+        .replace("時間", "h ")
+        .replace('分', "m");
+    format!("in {}", translated.trim())
 }
 
 fn codex_compact_percent(state: &CodexUsageState) -> f32 {
@@ -951,35 +1272,48 @@ fn status_color(status: CodexUsageStatus, palette: Palette) -> Color32 {
     }
 }
 
-fn draw_codex_links(ui: &mut egui::Ui, palette: Palette) {
+fn draw_codex_links(ui: &mut egui::Ui, language: Language, palette: Palette) {
     ui.horizontal_centered(|ui| {
         ui.hyperlink_to(
-            RichText::new("使用状況を開く")
-                .size(12.0)
-                .strong()
-                .underline()
-                .color(palette.codex_accent),
+            RichText::new(match language {
+                Language::Japanese => "使用状況を開く",
+                Language::English => "Open usage",
+            })
+            .size(12.0)
+            .strong()
+            .underline()
+            .color(palette.codex_accent),
             "https://chatgpt.com/codex/settings/usage",
         );
         ui.label(RichText::new(" / ").size(10.0).color(palette.text_subtle));
         ui.hyperlink_to(
-            RichText::new("Status page")
-                .size(12.0)
-                .strong()
-                .underline()
-                .color(palette.codex_accent),
+            RichText::new(match language {
+                Language::Japanese => "ステータスページ",
+                Language::English => "Status page",
+            })
+            .size(12.0)
+            .strong()
+            .underline()
+            .color(palette.codex_accent),
             "https://status.openai.com",
         );
     });
 }
 
-fn cpu_detail(snapshot: &Snapshot) -> String {
+fn cpu_detail(snapshot: &Snapshot, language: Language) -> String {
     match (snapshot.cpu_temp_c, snapshot.temp_source.as_deref()) {
-        (Some(temp), Some(source)) if !source.is_empty() => {
-            format!("温度 {temp:.0}℃ ・ {source}")
-        }
-        (Some(temp), _) => format!("温度 {temp:.0}℃"),
-        _ => "温度 --".to_owned(),
+        (Some(temp), Some(source)) if !source.is_empty() => match language {
+            Language::Japanese => format!("温度 {temp:.0}℃ ・ {source}"),
+            Language::English => format!("Temp {temp:.0}°C · {source}"),
+        },
+        (Some(temp), _) => match language {
+            Language::Japanese => format!("温度 {temp:.0}℃"),
+            Language::English => format!("Temp {temp:.0}°C"),
+        },
+        _ => match language {
+            Language::Japanese => "温度 --".to_owned(),
+            Language::English => "Temp --".to_owned(),
+        },
     }
 }
 
@@ -994,4 +1328,56 @@ fn compact_text(text: &str, max_chars: usize) -> String {
         .collect::<String>();
     compact.push('…');
     compact
+}
+
+#[cfg(test)]
+mod preference_tests {
+    use super::*;
+
+    #[test]
+    fn parses_supported_locale_forms_with_safe_unknown_result() {
+        assert_eq!(
+            language_from_locale("ja_JP.UTF-8"),
+            Some(Language::Japanese)
+        );
+        assert_eq!(language_from_locale("en-US"), Some(Language::English));
+        assert_eq!(
+            language_from_locale("(\"ja-JP\", \"en-JP\")"),
+            Some(Language::Japanese)
+        );
+        assert_eq!(language_from_locale("C"), None);
+    }
+
+    #[test]
+    fn preference_json_uses_canonical_values_and_round_trips() {
+        let preferences = UiPreferences {
+            language: LanguageChoice::En,
+            theme: ThemeChoice::Dark,
+        };
+        let json = serde_json::to_string(&preferences).expect("serialize preferences");
+        assert_eq!(json, r#"{"language":"en","theme":"dark"}"#);
+        assert_eq!(UiPreferences::from_json(&json), Some(preferences));
+        assert_eq!(
+            UiPreferences::from_json(r#"{"language":"xx","theme":"dark"}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn localized_labels_and_reset_text_cover_both_languages() {
+        assert_eq!(
+            language_choice_label(LanguageChoice::System, Language::English),
+            "System"
+        );
+        assert_eq!(
+            theme_choice_label(ThemeChoice::Light, Language::Japanese),
+            "ライト"
+        );
+        assert_eq!(localized_quota_label("週", Language::English), "Week");
+        assert_eq!(
+            localized_reset_text("あと1時間1分", Language::English),
+            "in 1h 1m"
+        );
+        assert_eq!(localized_reset_text("まもなく", Language::English), "Soon");
+    }
 }

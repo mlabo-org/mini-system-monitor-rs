@@ -16,8 +16,10 @@ use serde_json::{Value, json};
 
 const CODEX_COMMAND: &str = "codex";
 const APP_SERVER_ARG: &str = "app-server";
-const USER_LOCAL_CODEX: &str = "/Users/suzukimakoto/.local/bin/codex";
+const CHATGPT_APP_BUNDLED_CLI: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
 const CODEX_APP_BUNDLED_CLI: &str = "/Applications/Codex.app/Contents/Resources/codex";
+const CODEX_VIABILITY_TIMEOUT: Duration = Duration::from_secs(2);
+const CODEX_VIABILITY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
@@ -45,17 +47,6 @@ pub enum CodexUsageStatus {
     Ready,
     Stale,
     Unavailable,
-}
-
-impl CodexUsageStatus {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Loading => "LOADING",
-            Self::Ready => "READY",
-            Self::Stale => "STALE",
-            Self::Unavailable => "OFFLINE",
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -306,7 +297,7 @@ fn resolve_codex_executable_from(path_env: Option<&OsStr>, home: Option<&OsStr>)
         path_env,
         home,
         [
-            Path::new(USER_LOCAL_CODEX),
+            Path::new(CHATGPT_APP_BUNDLED_CLI),
             Path::new(CODEX_APP_BUNDLED_CLI),
         ],
     )
@@ -319,7 +310,7 @@ fn resolve_codex_executable_with_fixed_candidates<'a>(
 ) -> PathBuf {
     codex_executable_candidates(path_env, home, fixed_candidates)
         .into_iter()
-        .find(|candidate| is_executable_file(candidate))
+        .find(|candidate| is_executable_file(candidate) && is_viable_codex_executable(candidate))
         .unwrap_or_else(|| PathBuf::from(CODEX_COMMAND))
 }
 
@@ -331,21 +322,31 @@ fn codex_executable_candidates<'a>(
     let mut candidates = Vec::new();
 
     if let Some(path_env) = path_env {
-        candidates.extend(
-            env::split_paths(path_env)
-                .filter(|path| !path.as_os_str().is_empty())
-                .map(|path| path.join(CODEX_COMMAND)),
-        );
+        for candidate in env::split_paths(path_env)
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(|path| path.join(CODEX_COMMAND))
+        {
+            push_unique_path(&mut candidates, candidate);
+        }
     }
 
     if let Some(home) = home
         && !home.is_empty()
     {
-        candidates.push(Path::new(home).join(".local/bin/codex"));
+        push_unique_path(&mut candidates, Path::new(home).join(".local/bin/codex"));
     }
 
-    candidates.extend(fixed_candidates.into_iter().map(Path::to_path_buf));
+    for candidate in fixed_candidates {
+        push_unique_path(&mut candidates, candidate.to_path_buf());
+    }
+
     candidates
+}
+
+fn push_unique_path(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -367,6 +368,37 @@ fn is_executable_file(path: &Path) -> bool {
     #[cfg(not(unix))]
     {
         true
+    }
+}
+
+fn is_viable_codex_executable(path: &Path) -> bool {
+    is_viable_codex_executable_with_timeout(path, CODEX_VIABILITY_TIMEOUT)
+}
+
+fn is_viable_codex_executable_with_timeout(path: &Path, timeout: Duration) -> bool {
+    let Ok(mut child) = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(CODEX_VIABILITY_POLL_INTERVAL.min(timeout));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
     }
 }
 
@@ -605,8 +637,8 @@ mod tests {
         ))
     }
 
-    fn write_executable(path: &Path) {
-        fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write executable");
+    fn write_script(path: &Path, contents: &[u8]) {
+        fs::write(path, contents).expect("write executable");
 
         #[cfg(unix)]
         {
@@ -616,6 +648,10 @@ mod tests {
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions).expect("set executable permissions");
         }
+    }
+
+    fn write_executable(path: &Path) {
+        write_script(path, b"#!/bin/sh\nexit 0\n");
     }
 
     #[test]
@@ -722,6 +758,72 @@ mod tests {
         assert_eq!(resolved, codex);
 
         fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn skips_broken_path_wrapper_for_viable_bundled_candidate() {
+        let root = unique_temp_dir("broken-wrapper");
+        let path_dir = root.join("path-bin");
+        let bundled_dir = root.join("ChatGPT.app/Contents/Resources");
+        fs::create_dir_all(&path_dir).expect("create path bin");
+        fs::create_dir_all(&bundled_dir).expect("create bundled dir");
+
+        let broken_wrapper = path_dir.join(CODEX_COMMAND);
+        write_script(
+            &broken_wrapper,
+            b"#!/bin/sh\nexec /definitely/missing/codex \"$@\"\n",
+        );
+        let viable_candidate = bundled_dir.join(CODEX_COMMAND);
+        write_executable(&viable_candidate);
+
+        let path_env = OsString::from(path_dir.as_os_str());
+        let resolved = resolve_codex_executable_with_fixed_candidates(
+            Some(path_env.as_os_str()),
+            None,
+            [viable_candidate.as_path()],
+        );
+
+        assert_eq!(resolved, viable_candidate);
+
+        fs::remove_dir_all(root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn candidate_order_is_stable_and_duplicate_paths_are_removed() {
+        let root = unique_temp_dir("candidate-order");
+        let first_bin = root.join("first-bin");
+        let home = root.join("home");
+        let home_bin = home.join(".local/bin");
+        let fixed = root.join("ChatGPT.app/Contents/Resources/codex");
+        let path_env = env::join_paths([first_bin.as_path(), home_bin.as_path()])
+            .expect("join candidate paths");
+        let home_candidate = home_bin.join(CODEX_COMMAND);
+
+        let candidates = codex_executable_candidates(
+            Some(path_env.as_os_str()),
+            Some(home.as_os_str()),
+            [home_candidate.as_path(), fixed.as_path()],
+        );
+
+        assert_eq!(
+            candidates,
+            vec![first_bin.join(CODEX_COMMAND), home_candidate, fixed]
+        );
+    }
+
+    #[test]
+    fn viability_check_times_out_and_terminates_hung_candidate() {
+        let root = unique_temp_dir("hung-candidate");
+        fs::create_dir_all(&root).expect("create temp dir");
+        let candidate = root.join(CODEX_COMMAND);
+        write_script(&candidate, b"#!/bin/sh\nwhile :; do :; done\n");
+
+        assert!(!is_viable_codex_executable_with_timeout(
+            &candidate,
+            Duration::from_millis(50)
+        ));
+
+        fs::remove_dir_all(root).expect("remove temp dir");
     }
 
     #[test]
