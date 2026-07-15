@@ -1,6 +1,6 @@
 # mini-system-monitor-rs Local Constitution
 
-このファイルは `/Users/suzukimakoto/Desktop/git/current-work/mini-system-monitor-rs` 配下における Codex の局所 `AGENTS.md` であり、本スコープ内の実行条件を定義する SSOT である。
+このファイルは `/Users/suzukimakoto/Desktop/git/current-work/macos-tools/mini-system-monitor-rs` 配下における Codex の局所 `AGENTS.md` であり、本スコープ内の実行条件を定義する SSOT である。
 本書は助言集ではなく、既定動作、禁止事項、優先順位、ツール選択、検証条件を拘束する運用契約として扱う。
 上位の `AGENTS.md`、システム指示、開発者指示、ユーザーの明示要求と競合する場合は、Codex の優先順位規則に従う。
 より深い階層に別の `AGENTS.md` が存在する場合、そのスコープではより局所のファイルを優先する。
