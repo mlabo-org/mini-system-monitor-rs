@@ -28,6 +28,9 @@ const COMPACT_WINDOW_SIZE: [f32; 2] = [420.0, 170.0];
 const COMPACT_MIN_WINDOW_SIZE: [f32; 2] = [360.0, 150.0];
 const CODEX_WINDOW_SIZE: [f32; 2] = [580.0, 560.0];
 const CODEX_MIN_WINDOW_SIZE: [f32; 2] = [520.0, 480.0];
+const CODEX_WINDOW_GAP: f32 = 12.0;
+const CODEX_SCREEN_MARGIN: f32 = 8.0;
+const CODEX_WINDOW_CHROME_ESTIMATE: [f32; 2] = [0.0, 40.0];
 const JAPANESE_FONT_NAME: &str = "system_japanese";
 const JAPANESE_FONT_PATHS: &[&str] = &[
     "/System/Library/Fonts/Hiragino Sans.ttc",
@@ -209,6 +212,8 @@ struct MonitorApp {
     codex_rx: Receiver<CodexUsageState>,
     codex_control_tx: Sender<CodexControl>,
     codex_details_open: bool,
+    codex_details_position: Option<Pos2>,
+    codex_details_needs_exact_position: bool,
     display_mode: DisplayMode,
     preferences: UiPreferences,
     system_language: Language,
@@ -279,6 +284,8 @@ impl MonitorApp {
             codex_rx,
             codex_control_tx,
             codex_details_open: false,
+            codex_details_position: None,
+            codex_details_needs_exact_position: false,
             display_mode: DisplayMode::Full,
             preferences,
             system_language,
@@ -298,37 +305,88 @@ impl MonitorApp {
         }
     }
 
+    fn open_codex_details(&mut self) {
+        self.codex_details_open = true;
+        self.codex_details_position = None;
+        self.codex_details_needs_exact_position = true;
+    }
+
     fn draw_codex_details_window(&mut self, ctx: &egui::Context, language: Language) {
         if !self.codex_details_open {
             return;
+        }
+
+        let parent_rect = ctx.input(|input| input.viewport().outer_rect);
+        let screen_rect = parent_rect.and_then(|parent_rect| {
+            visible_screen_rects(ctx.zoom_factor())
+                .into_iter()
+                .max_by(|left, right| compare_screens_for_parent(*left, *right, parent_rect))
+        });
+        if self.codex_details_position.is_none()
+            && let (Some(parent_rect), Some(screen_rect)) = (parent_rect, screen_rect)
+        {
+            let estimated_outer_size = Vec2::new(
+                CODEX_WINDOW_SIZE[0] + CODEX_WINDOW_CHROME_ESTIMATE[0],
+                CODEX_WINDOW_SIZE[1]
+                    + CODEX_WINDOW_CHROME_ESTIMATE[1] / ctx.zoom_factor().max(0.01),
+            );
+            self.codex_details_position = Some(adjacent_window_position(
+                parent_rect,
+                estimated_outer_size,
+                screen_rect,
+            ));
         }
 
         let state = self.codex_usage.clone();
         let auto_reset = self.preferences.auto_reset;
         let mut open = true;
         let mut actions = Vec::new();
+        let mut measured_outer_size = None;
+        let needs_exact_position = self.codex_details_needs_exact_position;
+        let viewport_id = egui::ViewportId::from_hash_of("codex_management_window");
         let title = match language {
             Language::Japanese => "Codex 管理",
             Language::English => "Codex controls",
         };
+        let mut viewport_builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_inner_size(CODEX_WINDOW_SIZE)
+            .with_min_inner_size(CODEX_MIN_WINDOW_SIZE)
+            .with_resizable(true)
+            .with_window_level(egui::WindowLevel::AlwaysOnTop);
+        if let Some(position) = self.codex_details_position {
+            viewport_builder = viewport_builder.with_position(position);
+        }
 
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("codex_management_window"),
-            egui::ViewportBuilder::default()
-                .with_title(title)
-                .with_inner_size(CODEX_WINDOW_SIZE)
-                .with_min_inner_size(CODEX_MIN_WINDOW_SIZE)
-                .with_resizable(true)
-                .with_window_level(egui::WindowLevel::AlwaysOnTop),
-            |ui, _class| {
-                if ui.ctx().input(|input| input.viewport().close_requested()) {
-                    open = false;
-                }
-                draw_codex_management(ui, &state, auto_reset, language, &mut actions);
-            },
-        );
+        ctx.show_viewport_immediate(viewport_id, viewport_builder, |ui, _class| {
+            if ui.ctx().input(|input| input.viewport().close_requested()) {
+                open = false;
+            }
+            if needs_exact_position {
+                measured_outer_size = ui
+                    .ctx()
+                    .input(|input| input.viewport().outer_rect.map(|rect| rect.size()));
+            }
+            draw_codex_management(ui, &state, auto_reset, language, &mut actions);
+        });
+
+        if let (Some(parent_rect), Some(screen_rect), Some(outer_size)) =
+            (parent_rect, screen_rect, measured_outer_size)
+        {
+            let exact_position = adjacent_window_position(parent_rect, outer_size, screen_rect);
+            ctx.send_viewport_cmd_to(
+                viewport_id,
+                egui::ViewportCommand::OuterPosition(exact_position),
+            );
+            self.codex_details_position = Some(exact_position);
+            self.codex_details_needs_exact_position = false;
+        }
 
         self.codex_details_open = open;
+        if !open {
+            self.codex_details_position = None;
+            self.codex_details_needs_exact_position = false;
+        }
         for action in actions {
             let control = match action {
                 CodexUiAction::Refresh => {
@@ -418,13 +476,13 @@ impl eframe::App for MonitorApp {
                         language,
                         palette,
                     ) {
-                        self.codex_details_open = true;
+                        self.open_codex_details();
                     }
                 }
                 DisplayMode::Compact => {
                     should_toggle_mode |= draw_toggle_space(ui, 11.0);
                     if draw_compact_card(ui, &self.snapshot, &self.codex_usage, language, palette) {
-                        self.codex_details_open = true;
+                        self.open_codex_details();
                     }
                 }
             }
@@ -443,6 +501,172 @@ impl eframe::App for MonitorApp {
             apply_display_mode_size(ui.ctx(), self.display_mode);
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn visible_screen_rects(zoom_factor: f32) -> Vec<Rect> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSScreen;
+
+    let Some(main_thread_marker) = MainThreadMarker::new() else {
+        return Vec::new();
+    };
+    let screens = NSScreen::screens(main_thread_marker);
+    let main_screen_height = screens
+        .iter()
+        .map(|screen| screen.frame())
+        .find(|frame| frame.origin.x.abs() < 0.5 && frame.origin.y.abs() < 0.5)
+        .or_else(|| screens.firstObject().map(|screen| screen.frame()))
+        .map(|frame| frame.size.height)
+        .unwrap_or(0.0);
+    if main_screen_height <= 0.0 {
+        return Vec::new();
+    }
+
+    let zoom_factor = f64::from(zoom_factor.max(0.01));
+    screens
+        .iter()
+        .filter_map(|screen| {
+            let frame = screen.visibleFrame();
+            if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
+                return None;
+            }
+
+            Some(Rect::from_min_size(
+                Pos2::new(
+                    (frame.origin.x / zoom_factor) as f32,
+                    ((main_screen_height - frame.origin.y - frame.size.height) / zoom_factor)
+                        as f32,
+                ),
+                Vec2::new(
+                    (frame.size.width / zoom_factor) as f32,
+                    (frame.size.height / zoom_factor) as f32,
+                ),
+            ))
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn visible_screen_rects(_zoom_factor: f32) -> Vec<Rect> {
+    Vec::new()
+}
+
+fn compare_screens_for_parent(left: Rect, right: Rect, parent_rect: Rect) -> std::cmp::Ordering {
+    let left_overlap = rect_overlap_area(left, parent_rect);
+    let right_overlap = rect_overlap_area(right, parent_rect);
+    left_overlap.total_cmp(&right_overlap).then_with(|| {
+        rect_distance_squared(right, parent_rect)
+            .total_cmp(&rect_distance_squared(left, parent_rect))
+    })
+}
+
+fn adjacent_window_position(parent_rect: Rect, window_size: Vec2, screen_rect: Rect) -> Pos2 {
+    let centered_x = parent_rect.center().x - window_size.x / 2.0;
+    let centered_y = parent_rect.center().y - window_size.y / 2.0;
+    let ideal_positions = [
+        Pos2::new(parent_rect.right() + CODEX_WINDOW_GAP, centered_y),
+        Pos2::new(
+            parent_rect.left() - CODEX_WINDOW_GAP - window_size.x,
+            centered_y,
+        ),
+        Pos2::new(centered_x, parent_rect.bottom() + CODEX_WINDOW_GAP),
+        Pos2::new(
+            centered_x,
+            parent_rect.top() - CODEX_WINDOW_GAP - window_size.y,
+        ),
+    ];
+
+    ideal_positions
+        .into_iter()
+        .enumerate()
+        .map(|(preference, ideal_position)| {
+            let position = clamp_window_origin(
+                ideal_position,
+                window_size,
+                screen_rect,
+                CODEX_SCREEN_MARGIN,
+            );
+            let window_rect = Rect::from_min_size(position, window_size);
+            WindowPositionCandidate {
+                position,
+                overlap_area: rect_overlap_area(window_rect, parent_rect),
+                distance_squared: rect_distance_squared(window_rect, parent_rect),
+                correction_squared: (position - ideal_position).length_sq(),
+                preference,
+            }
+        })
+        .min_by(WindowPositionCandidate::compare)
+        .map(|candidate| candidate.position)
+        .unwrap_or(screen_rect.min)
+}
+
+struct WindowPositionCandidate {
+    position: Pos2,
+    overlap_area: f32,
+    distance_squared: f32,
+    correction_squared: f32,
+    preference: usize,
+}
+
+impl WindowPositionCandidate {
+    fn compare(left: &Self, right: &Self) -> std::cmp::Ordering {
+        left.overlap_area
+            .total_cmp(&right.overlap_area)
+            .then_with(|| left.distance_squared.total_cmp(&right.distance_squared))
+            .then_with(|| left.correction_squared.total_cmp(&right.correction_squared))
+            .then_with(|| left.preference.cmp(&right.preference))
+    }
+}
+
+fn clamp_window_origin(
+    position: Pos2,
+    window_size: Vec2,
+    screen_rect: Rect,
+    requested_margin: f32,
+) -> Pos2 {
+    let margin_x = requested_margin.min(((screen_rect.width() - window_size.x) / 2.0).max(0.0));
+    let margin_y = requested_margin.min(((screen_rect.height() - window_size.y) / 2.0).max(0.0));
+    let min_x = screen_rect.left() + margin_x;
+    let max_x = screen_rect.right() - margin_x - window_size.x;
+    let min_y = screen_rect.top() + margin_y;
+    let max_y = screen_rect.bottom() - margin_y - window_size.y;
+
+    Pos2::new(
+        clamp_axis(position.x, min_x, max_x),
+        clamp_axis(position.y, min_y, max_y),
+    )
+}
+
+fn clamp_axis(value: f32, minimum: f32, maximum: f32) -> f32 {
+    if minimum <= maximum {
+        value.clamp(minimum, maximum)
+    } else {
+        (minimum + maximum) / 2.0
+    }
+}
+
+fn rect_overlap_area(left: Rect, right: Rect) -> f32 {
+    let intersection = left.intersect(right);
+    intersection.width().max(0.0) * intersection.height().max(0.0)
+}
+
+fn rect_distance_squared(left: Rect, right: Rect) -> f32 {
+    let horizontal = if left.right() < right.left() {
+        right.left() - left.right()
+    } else if right.right() < left.left() {
+        left.left() - right.right()
+    } else {
+        0.0
+    };
+    let vertical = if left.bottom() < right.top() {
+        right.top() - left.bottom()
+    } else if right.bottom() < left.top() {
+        left.top() - right.bottom()
+    } else {
+        0.0
+    };
+    horizontal * horizontal + vertical * vertical
 }
 
 fn apply_preferences(ctx: &egui::Context, preferences: UiPreferences, system_language: Language) {
@@ -2143,6 +2367,71 @@ fn compact_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod preference_tests {
     use super::*;
+
+    fn assert_rect_fits(inner: Rect, outer: Rect) {
+        let epsilon = 0.01;
+        assert!(inner.left() >= outer.left() - epsilon);
+        assert!(inner.right() <= outer.right() + epsilon);
+        assert!(inner.top() >= outer.top() - epsilon);
+        assert!(inner.bottom() <= outer.bottom() + epsilon);
+    }
+
+    #[test]
+    fn places_codex_window_to_the_right_when_that_side_is_clear() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(2560.0, 1080.0));
+        let parent = Rect::from_min_size(Pos2::new(300.0, 250.0), Vec2::new(420.0, 430.0));
+        let window_size = Vec2::new(580.0, 600.0);
+
+        let position = adjacent_window_position(parent, window_size, screen);
+        let window = Rect::from_min_size(position, window_size);
+
+        assert_eq!(position.x, parent.right() + CODEX_WINDOW_GAP);
+        assert_eq!(rect_overlap_area(window, parent), 0.0);
+        assert_rect_fits(window, screen);
+    }
+
+    #[test]
+    fn places_codex_window_to_the_left_near_the_right_screen_edge() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(2560.0, 1080.0));
+        let parent = Rect::from_min_size(Pos2::new(2100.0, 250.0), Vec2::new(420.0, 430.0));
+        let window_size = Vec2::new(580.0, 600.0);
+
+        let position = adjacent_window_position(parent, window_size, screen);
+        let window = Rect::from_min_size(position, window_size);
+
+        assert_eq!(
+            window.right(),
+            parent.left() - CODEX_WINDOW_GAP,
+            "the clear left side should win over a clamped overlapping right candidate"
+        );
+        assert_eq!(rect_overlap_area(window, parent), 0.0);
+        assert_rect_fits(window, screen);
+    }
+
+    #[test]
+    fn keeps_the_codex_window_visible_on_a_cramped_screen() {
+        let screen = Rect::from_min_size(Pos2::new(-800.0, 0.0), Vec2::new(800.0, 700.0));
+        let parent = Rect::from_min_size(Pos2::new(-500.0, 140.0), Vec2::new(420.0, 430.0));
+        let window_size = Vec2::new(580.0, 600.0);
+
+        let position = adjacent_window_position(parent, window_size, screen);
+        let window = Rect::from_min_size(position, window_size);
+
+        assert_rect_fits(window, screen);
+    }
+
+    #[test]
+    fn selects_the_visible_screen_containing_the_main_window() {
+        let left_screen = Rect::from_min_size(Pos2::new(-1920.0, 0.0), Vec2::new(1920.0, 1080.0));
+        let main_screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(2560.0, 1080.0));
+        let parent = Rect::from_min_size(Pos2::new(-1200.0, 200.0), Vec2::new(420.0, 430.0));
+
+        let selected = [main_screen, left_screen]
+            .into_iter()
+            .max_by(|left, right| compare_screens_for_parent(*left, *right, parent));
+
+        assert_eq!(selected, Some(left_screen));
+    }
 
     #[test]
     fn parses_supported_locale_forms_with_safe_unknown_result() {
