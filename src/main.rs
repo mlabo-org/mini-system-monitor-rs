@@ -26,11 +26,12 @@ const FULL_WINDOW_SIZE: [f32; 2] = [420.0, 430.0];
 const FULL_MIN_WINDOW_SIZE: [f32; 2] = [390.0, 410.0];
 const COMPACT_WINDOW_SIZE: [f32; 2] = [420.0, 170.0];
 const COMPACT_MIN_WINDOW_SIZE: [f32; 2] = [360.0, 150.0];
-const CODEX_WINDOW_SIZE: [f32; 2] = [580.0, 560.0];
-const CODEX_MIN_WINDOW_SIZE: [f32; 2] = [520.0, 480.0];
+const CODEX_WINDOW_SIZE: [f32; 2] = [640.0, 820.0];
+const CODEX_MIN_WINDOW_SIZE: [f32; 2] = [560.0, 640.0];
 const CODEX_WINDOW_GAP: f32 = 12.0;
 const CODEX_SCREEN_MARGIN: f32 = 8.0;
 const CODEX_WINDOW_CHROME_ESTIMATE: [f32; 2] = [0.0, 40.0];
+const RESET_CREDIT_LIST_MAX_HEIGHT: f32 = 300.0;
 const JAPANESE_FONT_NAME: &str = "system_japanese";
 const JAPANESE_FONT_PATHS: &[&str] = &[
     "/System/Library/Fonts/Hiragino Sans.ttc",
@@ -311,6 +312,20 @@ impl MonitorApp {
         self.codex_details_needs_exact_position = true;
     }
 
+    fn close_codex_details(&mut self) {
+        self.codex_details_open = false;
+        self.codex_details_position = None;
+        self.codex_details_needs_exact_position = false;
+    }
+
+    fn toggle_codex_details(&mut self) {
+        if self.codex_details_open {
+            self.close_codex_details();
+        } else {
+            self.open_codex_details();
+        }
+    }
+
     fn draw_codex_details_window(&mut self, ctx: &egui::Context, language: Language) {
         if !self.codex_details_open {
             return;
@@ -322,14 +337,28 @@ impl MonitorApp {
                 .into_iter()
                 .max_by(|left, right| compare_screens_for_parent(*left, *right, parent_rect))
         });
+        let chrome_estimate = Vec2::new(
+            CODEX_WINDOW_CHROME_ESTIMATE[0],
+            CODEX_WINDOW_CHROME_ESTIMATE[1] / ctx.zoom_factor().max(0.01),
+        );
+        let desired_inner_size = screen_rect
+            .map(|screen_rect| {
+                Vec2::new(
+                    CODEX_WINDOW_SIZE[0].min(
+                        (screen_rect.width() - CODEX_SCREEN_MARGIN * 2.0)
+                            .max(CODEX_MIN_WINDOW_SIZE[0]),
+                    ),
+                    CODEX_WINDOW_SIZE[1].min(
+                        (screen_rect.height() - chrome_estimate.y - CODEX_SCREEN_MARGIN * 2.0)
+                            .max(CODEX_MIN_WINDOW_SIZE[1]),
+                    ),
+                )
+            })
+            .unwrap_or_else(|| Vec2::new(CODEX_WINDOW_SIZE[0], CODEX_WINDOW_SIZE[1]));
         if self.codex_details_position.is_none()
             && let (Some(parent_rect), Some(screen_rect)) = (parent_rect, screen_rect)
         {
-            let estimated_outer_size = Vec2::new(
-                CODEX_WINDOW_SIZE[0] + CODEX_WINDOW_CHROME_ESTIMATE[0],
-                CODEX_WINDOW_SIZE[1]
-                    + CODEX_WINDOW_CHROME_ESTIMATE[1] / ctx.zoom_factor().max(0.01),
-            );
+            let estimated_outer_size = desired_inner_size + chrome_estimate;
             self.codex_details_position = Some(adjacent_window_position(
                 parent_rect,
                 estimated_outer_size,
@@ -340,6 +369,7 @@ impl MonitorApp {
         let state = self.codex_usage.clone();
         let auto_reset = self.preferences.auto_reset;
         let mut open = true;
+        let mut close_requested = false;
         let mut actions = Vec::new();
         let mut measured_outer_size = None;
         let needs_exact_position = self.codex_details_needs_exact_position;
@@ -350,7 +380,7 @@ impl MonitorApp {
         };
         let mut viewport_builder = egui::ViewportBuilder::default()
             .with_title(title)
-            .with_inner_size(CODEX_WINDOW_SIZE)
+            .with_inner_size(desired_inner_size)
             .with_min_inner_size(CODEX_MIN_WINDOW_SIZE)
             .with_resizable(true)
             .with_window_level(egui::WindowLevel::AlwaysOnTop);
@@ -367,8 +397,19 @@ impl MonitorApp {
                     .ctx()
                     .input(|input| input.viewport().outer_rect.map(|rect| rect.size()));
             }
-            draw_codex_management(ui, &state, auto_reset, language, &mut actions);
+            draw_codex_management(
+                ui,
+                &state,
+                auto_reset,
+                language,
+                &mut actions,
+                &mut close_requested,
+            );
         });
+
+        if close_requested {
+            open = false;
+        }
 
         if let (Some(parent_rect), Some(screen_rect), Some(outer_size)) =
             (parent_rect, screen_rect, measured_outer_size)
@@ -382,10 +423,10 @@ impl MonitorApp {
             self.codex_details_needs_exact_position = false;
         }
 
-        self.codex_details_open = open;
-        if !open {
-            self.codex_details_position = None;
-            self.codex_details_needs_exact_position = false;
+        if open {
+            self.codex_details_open = true;
+        } else {
+            self.close_codex_details();
         }
         for action in actions {
             let control = match action {
@@ -473,16 +514,24 @@ impl eframe::App for MonitorApp {
                         ui,
                         &self.codex_usage,
                         self.preferences.auto_reset,
+                        self.codex_details_open,
                         language,
                         palette,
                     ) {
-                        self.open_codex_details();
+                        self.toggle_codex_details();
                     }
                 }
                 DisplayMode::Compact => {
                     should_toggle_mode |= draw_toggle_space(ui, 11.0);
-                    if draw_compact_card(ui, &self.snapshot, &self.codex_usage, language, palette) {
-                        self.open_codex_details();
+                    if draw_compact_card(
+                        ui,
+                        &self.snapshot,
+                        &self.codex_usage,
+                        self.codex_details_open,
+                        language,
+                        palette,
+                    ) {
+                        self.toggle_codex_details();
                     }
                 }
             }
@@ -1082,6 +1131,7 @@ fn draw_compact_card(
     ui: &mut egui::Ui,
     snapshot: &Snapshot,
     state: &CodexUsageState,
+    details_open: bool,
     language: Language,
     palette: Palette,
 ) -> bool {
@@ -1144,7 +1194,11 @@ fn draw_compact_card(
         &painter,
         codex_rect,
         CompactMetricDisplay {
-            title: "Codex ›",
+            title: if details_open {
+                "Codex ×"
+            } else {
+                "Codex ›"
+            },
             value: codex_compact_value(state, language),
             detail: codex_compact_detail(state, language),
             percent: codex_compact_percent(state),
@@ -1159,10 +1213,7 @@ fn draw_compact_card(
         Sense::click(),
     )
     .on_hover_cursor(CursorIcon::PointingHand)
-    .on_hover_text(match language {
-        Language::Japanese => "Codex管理を開く",
-        Language::English => "Open Codex controls",
-    })
+    .on_hover_text(codex_details_toggle_tooltip(details_open, language))
     .clicked()
 }
 
@@ -1269,6 +1320,7 @@ fn draw_codex_usage_card(
     ui: &mut egui::Ui,
     state: &CodexUsageState,
     auto_reset: bool,
+    details_open: bool,
     language: Language,
     palette: Palette,
 ) -> bool {
@@ -1320,13 +1372,14 @@ fn draw_codex_usage_card(
         draw_codex_usage_content(ui, state.content.as_ref(), language, palette);
     });
 
-    let mut open_details = false;
+    let mut toggle_details = false;
     ui.scope_builder(egui::UiBuilder::new().max_rect(footer_rect), |ui| {
         ui.set_clip_rect(footer_rect);
         ui.set_width(footer_rect.width());
-        open_details = draw_codex_summary_footer(ui, state, auto_reset, language, palette);
+        toggle_details =
+            draw_codex_summary_footer(ui, state, auto_reset, details_open, language, palette);
     });
-    open_details
+    toggle_details
 }
 
 fn draw_codex_usage_content(
@@ -1392,6 +1445,7 @@ fn draw_codex_summary_footer(
     ui: &mut egui::Ui,
     state: &CodexUsageState,
     auto_reset: bool,
+    details_open: bool,
     language: Language,
     palette: Palette,
 ) -> bool {
@@ -1409,7 +1463,7 @@ fn draw_codex_summary_footer(
             )
         })
         .unwrap_or_else(|| ("--".to_owned(), "--"));
-    let mut open_details = false;
+    let mut toggle_details = false;
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 7.0;
@@ -1440,26 +1494,39 @@ fn draw_codex_summary_footer(
         );
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            open_details = ui
+            toggle_details = ui
                 .add(
                     egui::Button::new(
-                        RichText::new(match language {
-                            Language::Japanese => "管理…",
-                            Language::English => "Manage…",
-                        })
-                        .size(11.0),
+                        RichText::new(codex_details_toggle_label(details_open, language))
+                            .size(11.0),
                     )
-                    .min_size(Vec2::new(60.0, 22.0)),
+                    .min_size(Vec2::new(60.0, 22.0))
+                    .selected(details_open),
                 )
-                .on_hover_text(match language {
-                    Language::Japanese => "Codex管理ウィンドウを開く",
-                    Language::English => "Open Codex controls",
-                })
+                .on_hover_text(codex_details_toggle_tooltip(details_open, language))
                 .clicked();
         });
     });
 
-    open_details
+    toggle_details
+}
+
+fn codex_details_toggle_label(details_open: bool, language: Language) -> &'static str {
+    match (details_open, language) {
+        (false, Language::Japanese) => "管理…",
+        (true, Language::Japanese) => "閉じる",
+        (false, Language::English) => "Manage…",
+        (true, Language::English) => "Close",
+    }
+}
+
+fn codex_details_toggle_tooltip(details_open: bool, language: Language) -> &'static str {
+    match (details_open, language) {
+        (false, Language::Japanese) => "Codex管理ウィンドウを開く",
+        (true, Language::Japanese) => "Codex管理ウィンドウを閉じる",
+        (false, Language::English) => "Open Codex controls",
+        (true, Language::English) => "Close Codex controls",
+    }
 }
 
 fn draw_codex_management(
@@ -1468,6 +1535,7 @@ fn draw_codex_management(
     auto_reset: bool,
     language: Language,
     actions: &mut Vec<CodexUiAction>,
+    close_requested: &mut bool,
 ) {
     let palette = Palette::for_theme(ui.ctx().theme());
     ui.painter()
@@ -1499,6 +1567,16 @@ fn draw_codex_management(
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(codex_details_toggle_label(true, language))
+                            .min_size(Vec2::new(60.0, 24.0)),
+                    )
+                    .on_hover_text(codex_details_toggle_tooltip(true, language))
+                    .clicked()
+                {
+                    *close_requested = true;
+                }
                 if ui
                     .add_enabled(
                         !busy,
@@ -1754,7 +1832,7 @@ fn draw_reset_credits_panel(
 
                 egui::ScrollArea::vertical()
                     .id_salt("reset_credit_list")
-                    .max_height(185.0)
+                    .max_height(RESET_CREDIT_LIST_MAX_HEIGHT)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for (index, credit) in inventory.credits.iter().enumerate() {
@@ -2490,6 +2568,22 @@ mod preference_tests {
             "in 1h 1m"
         );
         assert_eq!(localized_reset_text("まもなく", Language::English), "Soon");
+        assert_eq!(
+            codex_details_toggle_label(false, Language::Japanese),
+            "管理…"
+        );
+        assert_eq!(
+            codex_details_toggle_label(true, Language::Japanese),
+            "閉じる"
+        );
+        assert_eq!(
+            codex_details_toggle_tooltip(false, Language::English),
+            "Open Codex controls"
+        );
+        assert_eq!(
+            codex_details_toggle_tooltip(true, Language::English),
+            "Close Codex controls"
+        );
     }
 
     #[test]
