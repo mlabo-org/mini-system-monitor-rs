@@ -4,14 +4,14 @@ mod metrics;
 use std::{
     env, fs,
     process::Command,
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use codex_usage::{
-    CodexUsageContent, CodexUsagePoller, CodexUsageState, CodexUsageStatus, QuotaBucket,
-    QuotaWindow,
+    CodexActionKind, CodexActivity, CodexControl, CodexServiceTier, CodexUsageContent,
+    CodexUsagePoller, CodexUsageState, CodexUsageStatus, QuotaBucket, QuotaWindow, ResetCredit,
 };
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect,
@@ -26,6 +26,8 @@ const FULL_WINDOW_SIZE: [f32; 2] = [420.0, 430.0];
 const FULL_MIN_WINDOW_SIZE: [f32; 2] = [390.0, 410.0];
 const COMPACT_WINDOW_SIZE: [f32; 2] = [420.0, 170.0];
 const COMPACT_MIN_WINDOW_SIZE: [f32; 2] = [360.0, 150.0];
+const CODEX_WINDOW_SIZE: [f32; 2] = [580.0, 560.0];
+const CODEX_MIN_WINDOW_SIZE: [f32; 2] = [520.0, 480.0];
 const JAPANESE_FONT_NAME: &str = "system_japanese";
 const JAPANESE_FONT_PATHS: &[&str] = &[
     "/System/Library/Fonts/Hiragino Sans.ttc",
@@ -67,9 +69,11 @@ impl ThemeChoice {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 struct UiPreferences {
     language: LanguageChoice,
     theme: ThemeChoice,
+    auto_reset: bool,
 }
 
 impl UiPreferences {
@@ -203,6 +207,8 @@ struct MonitorApp {
     last_update: Instant,
     codex_usage: CodexUsageState,
     codex_rx: Receiver<CodexUsageState>,
+    codex_control_tx: Sender<CodexControl>,
+    codex_details_open: bool,
     display_mode: DisplayMode,
     preferences: UiPreferences,
     system_language: Language,
@@ -263,7 +269,7 @@ impl MonitorApp {
         apply_preferences(&cc.egui_ctx, preferences, system_language);
 
         let (snapshot, rx) = start_metrics_sampler();
-        let codex_rx = start_codex_usage_sampler();
+        let (codex_control_tx, codex_rx) = start_codex_usage_sampler(preferences.auto_reset);
 
         Self {
             snapshot,
@@ -271,6 +277,8 @@ impl MonitorApp {
             last_update: Instant::now(),
             codex_usage: CodexUsageState::loading(),
             codex_rx,
+            codex_control_tx,
+            codex_details_open: false,
             display_mode: DisplayMode::Full,
             preferences,
             system_language,
@@ -289,6 +297,74 @@ impl MonitorApp {
             self.codex_usage = codex_usage;
         }
     }
+
+    fn draw_codex_details_window(&mut self, ctx: &egui::Context, language: Language) {
+        if !self.codex_details_open {
+            return;
+        }
+
+        let state = self.codex_usage.clone();
+        let auto_reset = self.preferences.auto_reset;
+        let mut open = true;
+        let mut actions = Vec::new();
+        let title = match language {
+            Language::Japanese => "Codex 管理",
+            Language::English => "Codex controls",
+        };
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("codex_management_window"),
+            egui::ViewportBuilder::default()
+                .with_title(title)
+                .with_inner_size(CODEX_WINDOW_SIZE)
+                .with_min_inner_size(CODEX_MIN_WINDOW_SIZE)
+                .with_resizable(true)
+                .with_window_level(egui::WindowLevel::AlwaysOnTop),
+            |ui, _class| {
+                if ui.ctx().input(|input| input.viewport().close_requested()) {
+                    open = false;
+                }
+                draw_codex_management(ui, &state, auto_reset, language, &mut actions);
+            },
+        );
+
+        self.codex_details_open = open;
+        for action in actions {
+            let control = match action {
+                CodexUiAction::Refresh => {
+                    self.codex_usage.begin(CodexActionKind::Refresh);
+                    CodexControl::Refresh
+                }
+                CodexUiAction::SetAutoReset(enabled) => {
+                    self.preferences.auto_reset = enabled;
+                    self.codex_usage.begin(CodexActionKind::AutoReset);
+                    CodexControl::SetAutoReset(enabled)
+                }
+                CodexUiAction::SetServiceTier(service_tier) => {
+                    self.codex_usage.begin(CodexActionKind::ServiceTier);
+                    CodexControl::SetServiceTier(service_tier)
+                }
+            };
+
+            if self.codex_control_tx.send(control).is_err() {
+                self.codex_usage.activity = Some(CodexActivity::Error {
+                    action: match control {
+                        CodexControl::Refresh => CodexActionKind::Refresh,
+                        CodexControl::SetAutoReset(_) => CodexActionKind::AutoReset,
+                        CodexControl::SetServiceTier(_) => CodexActionKind::ServiceTier,
+                    },
+                    detail: "Codex background worker is unavailable".to_owned(),
+                });
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CodexUiAction {
+    Refresh,
+    SetAutoReset(bool),
+    SetServiceTier(CodexServiceTier),
 }
 
 impl eframe::App for MonitorApp {
@@ -335,11 +411,21 @@ impl eframe::App for MonitorApp {
                     draw_system_card(ui, &self.snapshot, language, palette);
 
                     should_toggle_mode |= draw_toggle_space(ui, 10.0);
-                    draw_codex_usage_card(ui, &self.codex_usage, language, palette);
+                    if draw_codex_usage_card(
+                        ui,
+                        &self.codex_usage,
+                        self.preferences.auto_reset,
+                        language,
+                        palette,
+                    ) {
+                        self.codex_details_open = true;
+                    }
                 }
                 DisplayMode::Compact => {
                     should_toggle_mode |= draw_toggle_space(ui, 11.0);
-                    draw_compact_card(ui, &self.snapshot, &self.codex_usage, language, palette);
+                    if draw_compact_card(ui, &self.snapshot, &self.codex_usage, language, palette) {
+                        self.codex_details_open = true;
+                    }
                 }
             }
 
@@ -349,6 +435,8 @@ impl eframe::App for MonitorApp {
 
             should_toggle_mode |= draw_remaining_toggle_space(ui);
         });
+
+        self.draw_codex_details_window(ui.ctx(), language);
 
         if should_toggle_mode {
             self.display_mode = self.display_mode.toggled();
@@ -582,25 +670,36 @@ fn start_metrics_sampler() -> (Snapshot, Receiver<Snapshot>) {
     (initial, rx)
 }
 
-fn start_codex_usage_sampler() -> Receiver<CodexUsageState> {
+fn start_codex_usage_sampler(
+    auto_reset_enabled: bool,
+) -> (Sender<CodexControl>, Receiver<CodexUsageState>) {
     let (tx, rx) = mpsc::channel();
+    let (control_tx, control_rx) = mpsc::channel();
 
     thread::spawn(move || {
-        let mut poller = CodexUsagePoller::new();
+        let mut poller = CodexUsagePoller::new(auto_reset_enabled);
+        if tx.send(poller.refresh()).is_err() {
+            return;
+        }
 
         loop {
-            let state = poller.refresh();
-            let delay = poller.next_delay();
+            let state = match control_rx.recv_timeout(poller.next_delay()) {
+                Ok(CodexControl::Refresh) => poller.refresh(),
+                Ok(CodexControl::SetAutoReset(enabled)) => poller.set_auto_reset_enabled(enabled),
+                Ok(CodexControl::SetServiceTier(service_tier)) => {
+                    poller.set_service_tier(service_tier)
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => poller.refresh(),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
 
             if tx.send(state).is_err() {
                 break;
             }
-
-            thread::sleep(delay);
         }
     });
 
-    rx
+    (control_tx, rx)
 }
 
 fn draw_header(
@@ -761,7 +860,7 @@ fn draw_compact_card(
     state: &CodexUsageState,
     language: Language,
     palette: Palette,
-) {
+) -> bool {
     let available_width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(available_width, 82.0), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -821,7 +920,7 @@ fn draw_compact_card(
         &painter,
         codex_rect,
         CompactMetricDisplay {
-            title: "Codex",
+            title: "Codex ›",
             value: codex_compact_value(state, language),
             detail: codex_compact_detail(state, language),
             percent: codex_compact_percent(state),
@@ -829,6 +928,18 @@ fn draw_compact_card(
         },
         palette,
     );
+
+    ui.interact(
+        codex_rect,
+        ui.make_persistent_id("compact_codex_details"),
+        Sense::click(),
+    )
+    .on_hover_cursor(CursorIcon::PointingHand)
+    .on_hover_text(match language {
+        Language::Japanese => "Codex管理を開く",
+        Language::English => "Open Codex controls",
+    })
+    .clicked()
 }
 
 struct CompactMetricDisplay {
@@ -933,9 +1044,10 @@ fn draw_metric_track(
 fn draw_codex_usage_card(
     ui: &mut egui::Ui,
     state: &CodexUsageState,
+    auto_reset: bool,
     language: Language,
     palette: Palette,
-) {
+) -> bool {
     let available_width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(available_width, 194.0), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -968,14 +1080,14 @@ fn draw_codex_usage_card(
         status_color(state.status, palette),
     );
 
-    let links_height = 24.0;
-    let links_rect = Rect::from_min_max(
-        Pos2::new(inner.left(), inner.bottom() - links_height),
+    let footer_height = 26.0;
+    let footer_rect = Rect::from_min_max(
+        Pos2::new(inner.left(), inner.bottom() - footer_height),
         inner.right_bottom(),
     );
     let content_rect = Rect::from_min_max(
         Pos2::new(inner.left(), inner.top() + 31.0),
-        Pos2::new(inner.right(), links_rect.top() - 7.0),
+        Pos2::new(inner.right(), footer_rect.top() - 7.0),
     );
 
     ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
@@ -984,12 +1096,13 @@ fn draw_codex_usage_card(
         draw_codex_usage_content(ui, state.content.as_ref(), language, palette);
     });
 
-    ui.scope_builder(egui::UiBuilder::new().max_rect(links_rect), |ui| {
-        ui.set_clip_rect(links_rect);
-        ui.set_width(links_rect.width());
-        ui.add_space(3.0);
-        draw_codex_links(ui, language, palette);
+    let mut open_details = false;
+    ui.scope_builder(egui::UiBuilder::new().max_rect(footer_rect), |ui| {
+        ui.set_clip_rect(footer_rect);
+        ui.set_width(footer_rect.width());
+        open_details = draw_codex_summary_footer(ui, state, auto_reset, language, palette);
     });
+    open_details
 }
 
 fn draw_codex_usage_content(
@@ -1049,6 +1162,573 @@ fn draw_codex_usage_content(
             );
         }
     });
+}
+
+fn draw_codex_summary_footer(
+    ui: &mut egui::Ui,
+    state: &CodexUsageState,
+    auto_reset: bool,
+    language: Language,
+    palette: Palette,
+) -> bool {
+    let (reset_count, service_tier) = state
+        .content
+        .as_ref()
+        .map(|content| {
+            (
+                content
+                    .reset_credits
+                    .available_count
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "--".to_owned()),
+                localized_service_tier(content.service_tier, language),
+            )
+        })
+        .unwrap_or_else(|| ("--".to_owned(), "--"));
+    let mut open_details = false;
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 7.0;
+        ui.label(
+            RichText::new(format!("RESET {reset_count}"))
+                .size(10.5)
+                .strong()
+                .color(palette.text_main),
+        );
+        ui.label(
+            RichText::new(service_tier)
+                .size(10.5)
+                .color(palette.codex_accent),
+        );
+        ui.label(
+            RichText::new(match (auto_reset, language) {
+                (true, Language::Japanese) => "自動 ON",
+                (false, Language::Japanese) => "自動 OFF",
+                (true, Language::English) => "Auto ON",
+                (false, Language::English) => "Auto OFF",
+            })
+            .size(10.5)
+            .color(if auto_reset {
+                palette.accent_green
+            } else {
+                palette.text_muted
+            }),
+        );
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            open_details = ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(match language {
+                            Language::Japanese => "管理…",
+                            Language::English => "Manage…",
+                        })
+                        .size(11.0),
+                    )
+                    .min_size(Vec2::new(60.0, 22.0)),
+                )
+                .on_hover_text(match language {
+                    Language::Japanese => "Codex管理ウィンドウを開く",
+                    Language::English => "Open Codex controls",
+                })
+                .clicked();
+        });
+    });
+
+    open_details
+}
+
+fn draw_codex_management(
+    ui: &mut egui::Ui,
+    state: &CodexUsageState,
+    auto_reset: bool,
+    language: Language,
+    actions: &mut Vec<CodexUiAction>,
+) {
+    let palette = Palette::for_theme(ui.ctx().theme());
+    ui.painter()
+        .rect_filled(ui.max_rect(), 0.0, palette.panel_bg);
+    let content_rect = ui.max_rect().shrink2(Vec2::new(18.0, 16.0));
+
+    ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
+        ui.set_width(content_rect.width());
+        let busy = state
+            .activity
+            .as_ref()
+            .is_some_and(|activity| matches!(activity, CodexActivity::Working(_)));
+
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(match language {
+                        Language::Japanese => "Codex 管理",
+                        Language::English => "Codex controls",
+                    })
+                    .size(18.0)
+                    .strong()
+                    .color(palette.text_main),
+                );
+                ui.label(
+                    RichText::new(last_updated_text(state, language))
+                        .size(11.0)
+                        .color(palette.text_muted),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new(match language {
+                            Language::Japanese => "再読込",
+                            Language::English => "Refresh",
+                        }),
+                    )
+                    .clicked()
+                {
+                    actions.push(CodexUiAction::Refresh);
+                }
+                ui.label(
+                    RichText::new(localized_status(state.status, language))
+                        .size(10.5)
+                        .color(status_color(state.status, palette)),
+                );
+            });
+        });
+
+        ui.add_space(10.0);
+        draw_codex_activity(ui, state, language, palette);
+        ui.add_space(8.0);
+
+        egui::ScrollArea::vertical()
+            .id_salt("codex_management_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                draw_codex_limits_panel(ui, state, language, palette);
+                ui.add_space(10.0);
+                draw_codex_controls_panel(ui, state, auto_reset, busy, language, palette, actions);
+                ui.add_space(10.0);
+                draw_reset_credits_panel(ui, state, language, palette);
+                ui.add_space(10.0);
+                draw_codex_links(ui, language, palette);
+                ui.add_space(4.0);
+            });
+    });
+}
+
+fn draw_codex_limits_panel(
+    ui: &mut egui::Ui,
+    state: &CodexUsageState,
+    language: Language,
+    palette: Palette,
+) {
+    ui.group(|ui| {
+        ui.set_width(ui.available_width());
+        ui.label(
+            RichText::new(match language {
+                Language::Japanese => "現在の利用枠",
+                Language::English => "Current limits",
+            })
+            .size(14.0)
+            .strong()
+            .color(palette.text_main),
+        );
+        ui.add_space(5.0);
+        draw_codex_usage_content(ui, state.content.as_ref(), language, palette);
+    });
+}
+
+fn draw_codex_controls_panel(
+    ui: &mut egui::Ui,
+    state: &CodexUsageState,
+    auto_reset: bool,
+    busy: bool,
+    language: Language,
+    palette: Palette,
+    actions: &mut Vec<CodexUiAction>,
+) {
+    ui.group(|ui| {
+        ui.set_width(ui.available_width());
+        ui.label(
+            RichText::new(match language {
+                Language::Japanese => "動作設定",
+                Language::English => "Behavior",
+            })
+            .size(14.0)
+            .strong()
+            .color(palette.text_main),
+        );
+        ui.add_space(7.0);
+
+        let current_tier = state
+            .content
+            .as_ref()
+            .map(|content| content.service_tier)
+            .unwrap_or(CodexServiceTier::Unknown);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(match language {
+                    Language::Japanese => "Codex既定速度",
+                    Language::English => "Codex default speed",
+                })
+                .size(12.5)
+                .color(palette.text_main),
+            );
+            ui.add_enabled_ui(!busy, |ui| {
+                if ui
+                    .selectable_label(
+                        current_tier == CodexServiceTier::Standard,
+                        "Standard",
+                    )
+                    .clicked()
+                    && current_tier != CodexServiceTier::Standard
+                {
+                    actions.push(CodexUiAction::SetServiceTier(
+                        CodexServiceTier::Standard,
+                    ));
+                }
+                if ui
+                    .selectable_label(current_tier == CodexServiceTier::Fast, "Fast")
+                    .clicked()
+                    && current_tier != CodexServiceTier::Fast
+                {
+                    actions.push(CodexUiAction::SetServiceTier(CodexServiceTier::Fast));
+                }
+            });
+        });
+        ui.label(
+            RichText::new(match language {
+                Language::Japanese => {
+                    "新規タスク／設定再読込後の既定値です。別の実行中タスクは即時変更されません。"
+                }
+                Language::English => {
+                    "Default for new tasks or after config reload; other running tasks are not switched immediately."
+                }
+            })
+            .size(11.0)
+            .color(palette.text_muted),
+        );
+
+        ui.add_space(8.0);
+        let mut next_auto_reset = auto_reset;
+        let response = ui.add_enabled(
+            !busy,
+            egui::Checkbox::new(
+                &mut next_auto_reset,
+                match language {
+                    Language::Japanese => "週次残量が0%ならRESETを自動使用",
+                    Language::English => "Auto-use RESET when weekly remaining reaches 0%",
+                },
+            ),
+        );
+        if response.changed() {
+            actions.push(CodexUiAction::SetAutoReset(next_auto_reset));
+        }
+        ui.label(
+            RichText::new(match language {
+                Language::Japanese => {
+                    "期限が最も近い利用可能な1枚だけを使います。初期設定はOFFです。"
+                }
+                Language::English => {
+                    "Uses only the available credit with the nearest expiry. Default is OFF."
+                }
+            })
+            .size(11.0)
+            .color(palette.text_muted),
+        );
+    });
+}
+
+fn draw_reset_credits_panel(
+    ui: &mut egui::Ui,
+    state: &CodexUsageState,
+    language: Language,
+    palette: Palette,
+) {
+    ui.group(|ui| {
+        ui.set_width(ui.available_width());
+        let inventory = state.content.as_ref().map(|content| &content.reset_credits);
+        let count = inventory
+            .and_then(|inventory| inventory.available_count)
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "--".to_owned());
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(match language {
+                    Language::Japanese => "RESETクレジット",
+                    Language::English => "RESET credits",
+                })
+                .size(14.0)
+                .strong()
+                .color(palette.text_main),
+            );
+            ui.label(
+                RichText::new(match language {
+                    Language::Japanese => format!("利用可能 {count}枚"),
+                    Language::English => format!("{count} available"),
+                })
+                .size(12.0)
+                .color(palette.codex_accent),
+            );
+        });
+        if let Some((expires_at, fetched_at)) = inventory
+            .and_then(|inventory| inventory.nearest_expiry())
+            .zip(state.content.as_ref().map(|content| content.fetched_at))
+        {
+            ui.label(
+                RichText::new(match language {
+                    Language::Japanese => {
+                        format!("最短期限: {}", expiry_text(Some(expires_at), fetched_at, language))
+                    }
+                    Language::English => {
+                        format!(
+                            "Nearest: {}",
+                            expiry_text(Some(expires_at), fetched_at, language)
+                        )
+                    }
+                })
+                .size(11.0)
+                .color(palette.warning_amber),
+            );
+        }
+        ui.add_space(5.0);
+
+        match inventory {
+            None => {
+                ui.label(
+                    RichText::new(match language {
+                        Language::Japanese => "クレジット情報を取得できていません。",
+                        Language::English => "Credit information is unavailable.",
+                    })
+                    .color(palette.text_muted),
+                );
+            }
+            Some(inventory) if inventory.available_count == Some(0) => {
+                ui.label(
+                    RichText::new(match language {
+                        Language::Japanese => "利用可能なRESETクレジットはありません。",
+                        Language::English => "No RESET credits are currently available.",
+                    })
+                    .color(palette.text_muted),
+                );
+            }
+            Some(inventory) => {
+                if !inventory.details_complete {
+                    ui.label(
+                        RichText::new(match language {
+                            Language::Japanese => {
+                                "在庫数のみ、または一覧が一部だけ取得されています。期限順を保証できない間は自動使用しません。"
+                            }
+                            Language::English => {
+                                "Only a count or partial list is available. Auto-use waits until nearest-expiry ordering can be guaranteed."
+                            }
+                        })
+                        .size(11.0)
+                        .color(palette.warning_amber),
+                    );
+                    ui.add_space(4.0);
+                }
+
+                egui::ScrollArea::vertical()
+                    .id_salt("reset_credit_list")
+                    .max_height(185.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (index, credit) in inventory.credits.iter().enumerate() {
+                            draw_reset_credit_row(
+                                ui,
+                                credit,
+                                index,
+                                state
+                                    .content
+                                    .as_ref()
+                                    .map(|content| content.fetched_at)
+                                    .unwrap_or_default(),
+                                language,
+                                palette,
+                            );
+                            if index + 1 < inventory.credits.len() {
+                                ui.add_space(5.0);
+                            }
+                        }
+                    });
+            }
+        }
+    });
+}
+
+fn draw_reset_credit_row(
+    ui: &mut egui::Ui,
+    credit: &ResetCredit,
+    index: usize,
+    now_secs: i64,
+    language: Language,
+    palette: Palette,
+) {
+    egui::Frame::new()
+        .fill(palette.card_bg)
+        .stroke(Stroke::new(1.0, palette.card_stroke))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(credit.title.as_deref().unwrap_or(match language {
+                        Language::Japanese => "Codex RESETクレジット",
+                        Language::English => "Codex RESET credit",
+                    }))
+                    .size(12.5)
+                    .strong()
+                    .color(palette.text_main),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("#{}", index + 1))
+                            .size(10.0)
+                            .color(palette.text_subtle),
+                    );
+                });
+            });
+
+            ui.label(
+                RichText::new(expiry_text(credit.expires_at, now_secs, language))
+                    .size(11.0)
+                    .color(if index == 0 {
+                        palette.warning_amber
+                    } else {
+                        palette.text_muted
+                    }),
+            );
+            if let Some(description) = credit.description.as_deref() {
+                ui.label(
+                    RichText::new(compact_text(description, 110))
+                        .size(11.0)
+                        .color(palette.text_muted),
+                );
+            }
+        });
+}
+
+fn draw_codex_activity(
+    ui: &mut egui::Ui,
+    state: &CodexUsageState,
+    language: Language,
+    palette: Palette,
+) {
+    let (text, color) = if let Some(activity) = state.activity.as_ref() {
+        localized_activity(activity, language, palette)
+    } else if let Some(error) = state.error.as_deref() {
+        (
+            format!(
+                "{}: {}",
+                match language {
+                    Language::Japanese => "更新エラー",
+                    Language::English => "Refresh error",
+                },
+                error
+            ),
+            palette.error_red,
+        )
+    } else {
+        return;
+    };
+
+    egui::Frame::new()
+        .fill(palette.track_bg)
+        .corner_radius(7)
+        .inner_margin(egui::Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).size(11.5).color(color));
+        });
+}
+
+fn localized_activity(
+    activity: &CodexActivity,
+    language: Language,
+    palette: Palette,
+) -> (String, Color32) {
+    match activity {
+        CodexActivity::Working(action) => (
+            match (action, language) {
+                (CodexActionKind::Refresh, Language::Japanese) => "再読込しています…",
+                (CodexActionKind::ServiceTier, Language::Japanese) => {
+                    "Codex既定速度を保存しています…"
+                }
+                (CodexActionKind::AutoReset, Language::Japanese) => {
+                    "自動RESET設定を反映しています…"
+                }
+                (CodexActionKind::Refresh, Language::English) => "Refreshing…",
+                (CodexActionKind::ServiceTier, Language::English) => "Saving Codex default speed…",
+                (CodexActionKind::AutoReset, Language::English) => "Applying auto-RESET setting…",
+            }
+            .to_owned(),
+            palette.codex_accent,
+        ),
+        CodexActivity::ServiceTierSaved(tier) => (
+            match language {
+                Language::Japanese => {
+                    format!(
+                        "Codex既定速度を{}に保存しました。",
+                        localized_service_tier(*tier, language)
+                    )
+                }
+                Language::English => {
+                    format!(
+                        "Saved Codex default speed as {}.",
+                        localized_service_tier(*tier, language)
+                    )
+                }
+            },
+            palette.accent_green,
+        ),
+        CodexActivity::ResetConsumed => (
+            match language {
+                Language::Japanese => "RESETクレジットを1枚使用しました。",
+                Language::English => "Used one RESET credit.",
+            }
+            .to_owned(),
+            palette.accent_green,
+        ),
+        CodexActivity::ResetAlreadyApplied => (
+            match language {
+                Language::Japanese => "同じRESET操作はすでに完了しています。",
+                Language::English => "This RESET operation was already completed.",
+            }
+            .to_owned(),
+            palette.accent_green,
+        ),
+        CodexActivity::ResetSkippedNoEligibleWindow => (
+            match language {
+                Language::Japanese => "現在RESETできる利用枠がありません。",
+                Language::English => "No current limit window is eligible for RESET.",
+            }
+            .to_owned(),
+            palette.warning_amber,
+        ),
+        CodexActivity::ResetSkippedNoCredit => (
+            match language {
+                Language::Japanese => "利用可能なRESETクレジットがありません。",
+                Language::English => "No RESET credit is available.",
+            }
+            .to_owned(),
+            palette.warning_amber,
+        ),
+        CodexActivity::Error { action, detail } => (
+            format!(
+                "{}: {}",
+                match (action, language) {
+                    (CodexActionKind::Refresh, Language::Japanese) => "再読込エラー",
+                    (CodexActionKind::ServiceTier, Language::Japanese) => "速度設定エラー",
+                    (CodexActionKind::AutoReset, Language::Japanese) => "自動RESETエラー",
+                    (CodexActionKind::Refresh, Language::English) => "Refresh error",
+                    (CodexActionKind::ServiceTier, Language::English) => "Speed setting error",
+                    (CodexActionKind::AutoReset, Language::English) => "Auto-RESET error",
+                },
+                detail
+            ),
+            palette.error_red,
+        ),
+    }
 }
 
 fn draw_quota_section(
@@ -1186,9 +1866,32 @@ fn codex_compact_detail(state: &CodexUsageState, language: Language) -> String {
     state
         .content
         .as_ref()
-        .map(|content| match language {
-            Language::Japanese => format!("週 {}残", content.codex.weekly.remaining_text()),
-            Language::English => format!("Week {} left", content.codex.weekly.remaining_text()),
+        .map(|content| {
+            let tier = match content.service_tier {
+                CodexServiceTier::Standard => "S",
+                CodexServiceTier::Fast => "F",
+                CodexServiceTier::Unknown => "?",
+            };
+            match language {
+                Language::Japanese => format!(
+                    "週{} R{} {tier}",
+                    content.codex.weekly.remaining_text(),
+                    content
+                        .reset_credits
+                        .available_count
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|| "--".to_owned())
+                ),
+                Language::English => format!(
+                    "W{} R{} {tier}",
+                    content.codex.weekly.remaining_text(),
+                    content
+                        .reset_credits
+                        .available_count
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|| "--".to_owned())
+                ),
+            }
         })
         .unwrap_or_else(|| match language {
             Language::Japanese => "使用量 --".to_owned(),
@@ -1221,6 +1924,113 @@ fn localized_status(status: CodexUsageStatus, language: Language) -> &'static st
         (CodexUsageStatus::Stale, Language::English) => "STALE",
         (CodexUsageStatus::Unavailable, Language::English) => "OFFLINE",
     }
+}
+
+fn localized_service_tier(service_tier: CodexServiceTier, language: Language) -> &'static str {
+    match (service_tier, language) {
+        (CodexServiceTier::Standard, _) => "Standard",
+        (CodexServiceTier::Fast, _) => "Fast",
+        (CodexServiceTier::Unknown, Language::Japanese) => "不明",
+        (CodexServiceTier::Unknown, Language::English) => "Unknown",
+    }
+}
+
+fn last_updated_text(state: &CodexUsageState, language: Language) -> String {
+    let Some(fetched_at) = state.content.as_ref().map(|content| content.fetched_at) else {
+        return match language {
+            Language::Japanese => "最終更新 --",
+            Language::English => "Last updated --",
+        }
+        .to_owned();
+    };
+    let age = unix_now_seconds().saturating_sub(fetched_at).max(0);
+    match language {
+        Language::Japanese if age < 60 => format!("最終更新 {age}秒前"),
+        Language::Japanese => format!("最終更新 {}分前", age / 60),
+        Language::English if age < 60 => format!("Last updated {age}s ago"),
+        Language::English => format!("Last updated {}m ago", age / 60),
+    }
+}
+
+fn expiry_text(expires_at: Option<i64>, now_secs: i64, language: Language) -> String {
+    let Some(expires_at) = expires_at else {
+        return match language {
+            Language::Japanese => "有効期限なし",
+            Language::English => "No expiry",
+        }
+        .to_owned();
+    };
+    let exact = format_unix_utc(expires_at);
+    let remaining = expires_at.saturating_sub(now_secs);
+    let relative = format_relative_duration(remaining, language);
+    match language {
+        Language::Japanese => format!("期限 {exact} UTC（{relative}）"),
+        Language::English => format!("Expires {exact} UTC ({relative})"),
+    }
+}
+
+fn format_relative_duration(seconds: i64, language: Language) -> String {
+    if seconds <= 0 {
+        return match language {
+            Language::Japanese => "期限切れ",
+            Language::English => "expired",
+        }
+        .to_owned();
+    }
+
+    let minutes = (seconds + 59) / 60;
+    let days = minutes / (24 * 60);
+    let hours = (minutes % (24 * 60)) / 60;
+    let mins = minutes % 60;
+    match language {
+        Language::Japanese if days > 0 && hours > 0 => format!("あと{days}日{hours}時間"),
+        Language::Japanese if days > 0 => format!("あと{days}日"),
+        Language::Japanese if hours > 0 && mins > 0 => format!("あと{hours}時間{mins}分"),
+        Language::Japanese if hours > 0 => format!("あと{hours}時間"),
+        Language::Japanese => format!("あと{mins}分"),
+        Language::English if days > 0 && hours > 0 => format!("in {days}d {hours}h"),
+        Language::English if days > 0 => format!("in {days}d"),
+        Language::English if hours > 0 && mins > 0 => format!("in {hours}h {mins}m"),
+        Language::English if hours > 0 => format!("in {hours}h"),
+        Language::English => format!("in {mins}m"),
+    }
+}
+
+fn format_unix_utc(timestamp: i64) -> String {
+    let days = timestamp.div_euclid(86_400);
+    let seconds = timestamp.rem_euclid(86_400);
+    let (year, month, day) = civil_date_from_days(days);
+    let hour = seconds / 3_600;
+    let minute = (seconds % 3_600) / 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
+}
+
+fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let shifted = days_since_epoch + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month, day)
+}
+
+fn unix_now_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn localized_quota_label(label: &'static str, language: Language) -> &'static str {
@@ -1353,10 +2163,22 @@ mod preference_tests {
         let preferences = UiPreferences {
             language: LanguageChoice::En,
             theme: ThemeChoice::Dark,
+            auto_reset: true,
         };
         let json = serde_json::to_string(&preferences).expect("serialize preferences");
-        assert_eq!(json, r#"{"language":"en","theme":"dark"}"#);
+        assert_eq!(
+            json,
+            r#"{"language":"en","theme":"dark","auto_reset":true}"#
+        );
         assert_eq!(UiPreferences::from_json(&json), Some(preferences));
+        assert_eq!(
+            UiPreferences::from_json(r#"{"language":"en","theme":"dark"}"#),
+            Some(UiPreferences {
+                language: LanguageChoice::En,
+                theme: ThemeChoice::Dark,
+                auto_reset: false,
+            })
+        );
         assert_eq!(
             UiPreferences::from_json(r#"{"language":"xx","theme":"dark"}"#),
             None
@@ -1379,5 +2201,15 @@ mod preference_tests {
             "in 1h 1m"
         );
         assert_eq!(localized_reset_text("まもなく", Language::English), "Soon");
+    }
+
+    #[test]
+    fn formats_reset_credit_expiry_as_exact_utc_and_relative_time() {
+        assert_eq!(format_unix_utc(0), "1970-01-01 00:00");
+        assert_eq!(format_unix_utc(86_400), "1970-01-02 00:00");
+        assert_eq!(
+            expiry_text(Some(86_400), 0, Language::Japanese),
+            "期限 1970-01-02 00:00 UTC（あと1日）"
+        );
     }
 }
