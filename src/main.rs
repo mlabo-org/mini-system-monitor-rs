@@ -2262,12 +2262,12 @@ fn expiry_text(expires_at: Option<i64>, now_secs: i64, language: Language) -> St
         }
         .to_owned();
     };
-    let exact = format_unix_utc(expires_at);
+    let (exact, time_zone) = format_unix_local(expires_at);
     let remaining = expires_at.saturating_sub(now_secs);
     let relative = format_relative_duration(remaining, language);
     match language {
-        Language::Japanese => format!("期限 {exact} UTC（{relative}）"),
-        Language::English => format!("Expires {exact} UTC ({relative})"),
+        Language::Japanese => format!("期限 {exact} {time_zone}（{relative}）"),
+        Language::English => format!("Expires {exact} {time_zone} ({relative})"),
     }
 }
 
@@ -2305,6 +2305,54 @@ fn format_unix_utc(timestamp: i64) -> String {
     let hour = seconds / 3_600;
     let minute = (seconds % 3_600) / 60;
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
+}
+
+fn format_unix_local(timestamp: i64) -> (String, String) {
+    system_local_datetime(timestamp)
+        .unwrap_or_else(|| (format_unix_utc(timestamp), "UTC".to_owned()))
+}
+
+#[cfg(target_os = "macos")]
+fn system_local_datetime(timestamp: i64) -> Option<(String, String)> {
+    let raw_time: libc::time_t = timestamp;
+    let mut local_time = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let local_time = unsafe {
+        if libc::localtime_r(&raw_time, local_time.as_mut_ptr()).is_null() {
+            return None;
+        }
+        local_time.assume_init()
+    };
+
+    let exact = format_local_time_part(&local_time, b"%Y-%m-%d %H:%M\0")?;
+    let time_zone = format_local_time_part(&local_time, b"%Z\0")?;
+    if time_zone.is_empty() {
+        return None;
+    }
+    Some((exact, time_zone))
+}
+
+#[cfg(target_os = "macos")]
+fn format_local_time_part(local_time: &libc::tm, format: &[u8]) -> Option<String> {
+    let mut output = [0_i8; 64];
+    let written = unsafe {
+        libc::strftime(
+            output.as_mut_ptr(),
+            output.len(),
+            format.as_ptr().cast(),
+            local_time,
+        )
+    };
+    if written == 0 {
+        return None;
+    }
+
+    let value = unsafe { std::ffi::CStr::from_ptr(output.as_ptr()) };
+    value.to_str().ok().map(str::to_owned)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn system_local_datetime(_timestamp: i64) -> Option<(String, String)> {
+    None
 }
 
 fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
@@ -2587,12 +2635,15 @@ mod preference_tests {
     }
 
     #[test]
-    fn formats_reset_credit_expiry_as_exact_utc_and_relative_time() {
+    fn formats_reset_credit_expiry_in_system_time_zone_and_relative_time() {
         assert_eq!(format_unix_utc(0), "1970-01-01 00:00");
         assert_eq!(format_unix_utc(86_400), "1970-01-02 00:00");
+        let (exact, time_zone) = format_unix_local(86_400);
+        assert!(!exact.is_empty());
+        assert!(!time_zone.is_empty());
         assert_eq!(
             expiry_text(Some(86_400), 0, Language::Japanese),
-            "期限 1970-01-02 00:00 UTC（あと1日）"
+            format!("期限 {exact} {time_zone}（あと1日）")
         );
     }
 }
