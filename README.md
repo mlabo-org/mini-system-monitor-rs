@@ -27,6 +27,15 @@ instead of guessing.
 cargo run
 ```
 
+## Build macOS App
+
+```bash
+Scripts/build-app.sh --output target/app
+```
+
+This produces an ad-hoc signed `target/app/Mini System Monitor.app` with the
+source-owned app icon and bundle metadata.
+
 ## Validate
 
 ```bash
