@@ -109,6 +109,14 @@ impl UiPreferences {
     }
 }
 
+fn increment_ui_font_size(points: u8) -> u8 {
+    points.saturating_add(1).min(UI_FONT_SIZE_MAX_POINTS)
+}
+
+fn decrement_ui_font_size(points: u8) -> u8 {
+    points.saturating_sub(1).max(UI_FONT_SIZE_MIN_POINTS)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Language {
     Japanese,
@@ -822,18 +830,58 @@ fn draw_preferences(
                 Language::Japanese => "文字",
                 Language::English => "Text",
             });
-            ui.add_sized(
-                [58.0, 22.0],
-                egui::DragValue::new(&mut preferences.font_size_points)
-                    .range(UI_FONT_SIZE_MIN_POINTS..=UI_FONT_SIZE_MAX_POINTS)
-                    .speed(1.0)
-                    .fixed_decimals(0)
-                    .max_decimals(0)
-                    .suffix(" pt"),
-            )
-            .on_hover_text(match language {
-                Language::Japanese => "UI文字サイズ（10〜32 pt、1 pt刻み）",
-                Language::English => "UI text size (10–32 pt, 1 pt steps)",
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.add_sized(
+                    [52.0, 22.0],
+                    egui::DragValue::new(&mut preferences.font_size_points)
+                        .range(UI_FONT_SIZE_MIN_POINTS..=UI_FONT_SIZE_MAX_POINTS)
+                        .speed(1.0)
+                        .fixed_decimals(0)
+                        .max_decimals(0)
+                        .suffix(" pt"),
+                )
+                .on_hover_text(match language {
+                    Language::Japanese => "UI文字サイズ（10〜32 pt、1 pt刻み）",
+                    Language::English => "UI text size (10–32 pt, 1 pt steps)",
+                });
+
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.spacing_mut().button_padding = Vec2::ZERO;
+
+                    if ui
+                        .add_enabled(
+                            preferences.font_size_points < UI_FONT_SIZE_MAX_POINTS,
+                            egui::Button::new(RichText::new("▲").size(7.0))
+                                .min_size(Vec2::new(16.0, 10.0)),
+                        )
+                        .on_hover_text(match language {
+                            Language::Japanese => "文字サイズを1 pt大きくする",
+                            Language::English => "Increase text size by 1 pt",
+                        })
+                        .clicked()
+                    {
+                        preferences.font_size_points =
+                            increment_ui_font_size(preferences.font_size_points);
+                    }
+
+                    if ui
+                        .add_enabled(
+                            preferences.font_size_points > UI_FONT_SIZE_MIN_POINTS,
+                            egui::Button::new(RichText::new("▼").size(7.0))
+                                .min_size(Vec2::new(16.0, 10.0)),
+                        )
+                        .on_hover_text(match language {
+                            Language::Japanese => "文字サイズを1 pt小さくする",
+                            Language::English => "Decrease text size by 1 pt",
+                        })
+                        .clicked()
+                    {
+                        preferences.font_size_points =
+                            decrement_ui_font_size(preferences.font_size_points);
+                    }
+                });
             });
         });
     });
@@ -2677,6 +2725,14 @@ mod preference_tests {
             UiPreferences::from_json(r#"{"language":"xx","theme":"dark"}"#),
             None
         );
+    }
+
+    #[test]
+    fn font_size_step_buttons_move_one_point_and_stop_at_bounds() {
+        assert_eq!(increment_ui_font_size(16), 17);
+        assert_eq!(decrement_ui_font_size(16), 15);
+        assert_eq!(increment_ui_font_size(UI_FONT_SIZE_MAX_POINTS), 32);
+        assert_eq!(decrement_ui_font_size(UI_FONT_SIZE_MIN_POINTS), 10);
     }
 
     #[test]
