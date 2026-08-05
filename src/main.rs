@@ -25,10 +25,10 @@ const PREFERENCES_STORAGE_KEY: &str = "mini-system-monitor-rs.ui-preferences.v1"
 const UI_FONT_SIZE_MIN_POINTS: u8 = 10;
 const UI_FONT_SIZE_MAX_POINTS: u8 = 32;
 const UI_FONT_SIZE_DEFAULT_POINTS: u8 = 16;
-const FULL_WINDOW_SIZE: [f32; 2] = [420.0, 448.0];
-const FULL_MIN_WINDOW_SIZE: [f32; 2] = [390.0, 428.0];
-const COMPACT_WINDOW_SIZE: [f32; 2] = [420.0, 188.0];
-const COMPACT_MIN_WINDOW_SIZE: [f32; 2] = [360.0, 168.0];
+const FULL_WINDOW_SIZE: [f32; 2] = [480.0, 448.0];
+const FULL_MIN_WINDOW_SIZE: [f32; 2] = [450.0, 428.0];
+const COMPACT_WINDOW_SIZE: [f32; 2] = [480.0, 188.0];
+const COMPACT_MIN_WINDOW_SIZE: [f32; 2] = [430.0, 168.0];
 const CODEX_WINDOW_SIZE: [f32; 2] = [640.0, 820.0];
 const CODEX_MIN_WINDOW_SIZE: [f32; 2] = [560.0, 640.0];
 const CODEX_WINDOW_GAP: f32 = 12.0;
@@ -115,6 +115,13 @@ fn increment_ui_font_size(points: u8) -> u8 {
 
 fn decrement_ui_font_size(points: u8) -> u8 {
     points.saturating_sub(1).max(UI_FONT_SIZE_MIN_POINTS)
+}
+
+fn commit_ui_font_size(applied_points: &mut u8, draft_points: u8) -> bool {
+    let next_points = draft_points.clamp(UI_FONT_SIZE_MIN_POINTS, UI_FONT_SIZE_MAX_POINTS);
+    let changed = *applied_points != next_points;
+    *applied_points = next_points;
+    changed
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -248,6 +255,7 @@ struct MonitorApp {
     codex_details_needs_exact_position: bool,
     display_mode: DisplayMode,
     preferences: UiPreferences,
+    draft_font_size_points: u8,
     system_language: Language,
     display_resize_pending: bool,
 }
@@ -304,6 +312,7 @@ impl MonitorApp {
             .as_deref()
             .and_then(UiPreferences::from_json)
             .unwrap_or_default();
+        let draft_font_size_points = preferences.font_size_points;
         apply_preferences(&cc.egui_ctx, preferences, system_language);
         let display_resize_pending =
             (preferences.zoom_factor() - cc.egui_ctx.zoom_factor()).abs() > f32::EPSILON;
@@ -323,6 +332,7 @@ impl MonitorApp {
             codex_details_needs_exact_position: false,
             display_mode: DisplayMode::Full,
             preferences,
+            draft_font_size_points,
             system_language,
             display_resize_pending,
         }
@@ -581,7 +591,13 @@ impl eframe::App for MonitorApp {
 
             ui.add_space(8.0);
             let previous_font_size = self.preferences.font_size_points;
-            if draw_preferences(ui, &mut self.preferences, language) {
+            if draw_preferences(
+                ui,
+                &mut self.preferences,
+                &mut self.draft_font_size_points,
+                language,
+                palette,
+            ) {
                 apply_preferences(ui.ctx(), self.preferences, self.system_language);
                 if self.preferences.font_size_points != previous_font_size {
                     self.display_resize_pending = true;
@@ -781,7 +797,9 @@ fn apply_preferences(ctx: &egui::Context, preferences: UiPreferences, system_lan
 fn draw_preferences(
     ui: &mut egui::Ui,
     preferences: &mut UiPreferences,
+    draft_font_size_points: &mut u8,
     language: Language,
+    palette: Palette,
 ) -> bool {
     let previous = *preferences;
     ui.scope(|ui| {
@@ -834,7 +852,7 @@ fn draw_preferences(
                 ui.spacing_mut().item_spacing.x = 2.0;
                 ui.add_sized(
                     [52.0, 22.0],
-                    egui::DragValue::new(&mut preferences.font_size_points)
+                    egui::DragValue::new(draft_font_size_points)
                         .range(UI_FONT_SIZE_MIN_POINTS..=UI_FONT_SIZE_MAX_POINTS)
                         .speed(1.0)
                         .fixed_decimals(0)
@@ -852,7 +870,7 @@ fn draw_preferences(
 
                     if ui
                         .add_enabled(
-                            preferences.font_size_points < UI_FONT_SIZE_MAX_POINTS,
+                            *draft_font_size_points < UI_FONT_SIZE_MAX_POINTS,
                             egui::Button::new(RichText::new("▲").size(7.0))
                                 .min_size(Vec2::new(16.0, 10.0)),
                         )
@@ -862,13 +880,12 @@ fn draw_preferences(
                         })
                         .clicked()
                     {
-                        preferences.font_size_points =
-                            increment_ui_font_size(preferences.font_size_points);
+                        *draft_font_size_points = increment_ui_font_size(*draft_font_size_points);
                     }
 
                     if ui
                         .add_enabled(
-                            preferences.font_size_points > UI_FONT_SIZE_MIN_POINTS,
+                            *draft_font_size_points > UI_FONT_SIZE_MIN_POINTS,
                             egui::Button::new(RichText::new("▼").size(7.0))
                                 .min_size(Vec2::new(16.0, 10.0)),
                         )
@@ -878,10 +895,42 @@ fn draw_preferences(
                         })
                         .clicked()
                     {
-                        preferences.font_size_points =
-                            decrement_ui_font_size(preferences.font_size_points);
+                        *draft_font_size_points = decrement_ui_font_size(*draft_font_size_points);
                     }
                 });
+
+                let has_pending_change = preferences.font_size_points != *draft_font_size_points;
+                let (button_text, button_color, tooltip) = match (has_pending_change, language) {
+                    (true, Language::Japanese) => {
+                        ("確定", palette.error_red, "未確定の文字サイズを適用する")
+                    }
+                    (true, Language::English) => {
+                        ("Apply", palette.error_red, "Apply the pending text size")
+                    }
+                    (false, Language::Japanese) => {
+                        ("確定済", palette.codex_accent, "文字サイズは適用済み")
+                    }
+                    (false, Language::English) => {
+                        ("Applied", palette.codex_accent, "The text size is applied")
+                    }
+                };
+                let confirm_button = egui::Button::new(
+                    RichText::new(button_text)
+                        .size(11.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                )
+                .min_size(Vec2::new(60.0, 22.0))
+                .fill(button_color)
+                .stroke(Stroke::new(1.0, button_color))
+                .sense(if has_pending_change {
+                    Sense::click()
+                } else {
+                    Sense::hover()
+                });
+                if ui.add(confirm_button).on_hover_text(tooltip).clicked() {
+                    commit_ui_font_size(&mut preferences.font_size_points, *draft_font_size_points);
+                }
             });
         });
     });
@@ -2733,6 +2782,18 @@ mod preference_tests {
         assert_eq!(decrement_ui_font_size(16), 15);
         assert_eq!(increment_ui_font_size(UI_FONT_SIZE_MAX_POINTS), 32);
         assert_eq!(decrement_ui_font_size(UI_FONT_SIZE_MIN_POINTS), 10);
+    }
+
+    #[test]
+    fn font_size_is_only_committed_when_confirmation_runs() {
+        let mut applied_points = 16;
+        let draft_points = increment_ui_font_size(applied_points);
+
+        assert_eq!(applied_points, 16);
+        assert_eq!(draft_points, 17);
+        assert!(commit_ui_font_size(&mut applied_points, draft_points));
+        assert_eq!(applied_points, 17);
+        assert!(!commit_ui_font_size(&mut applied_points, draft_points));
     }
 
     #[test]
