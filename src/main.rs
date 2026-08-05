@@ -22,10 +22,13 @@ use serde::{Deserialize, Serialize};
 
 const APP_TITLE: &str = "システムモニター";
 const PREFERENCES_STORAGE_KEY: &str = "mini-system-monitor-rs.ui-preferences.v1";
-const FULL_WINDOW_SIZE: [f32; 2] = [420.0, 430.0];
-const FULL_MIN_WINDOW_SIZE: [f32; 2] = [390.0, 410.0];
-const COMPACT_WINDOW_SIZE: [f32; 2] = [420.0, 170.0];
-const COMPACT_MIN_WINDOW_SIZE: [f32; 2] = [360.0, 150.0];
+const UI_FONT_SIZE_MIN_POINTS: u8 = 10;
+const UI_FONT_SIZE_MAX_POINTS: u8 = 32;
+const UI_FONT_SIZE_DEFAULT_POINTS: u8 = 16;
+const FULL_WINDOW_SIZE: [f32; 2] = [420.0, 448.0];
+const FULL_MIN_WINDOW_SIZE: [f32; 2] = [390.0, 428.0];
+const COMPACT_WINDOW_SIZE: [f32; 2] = [420.0, 188.0];
+const COMPACT_MIN_WINDOW_SIZE: [f32; 2] = [360.0, 168.0];
 const CODEX_WINDOW_SIZE: [f32; 2] = [640.0, 820.0];
 const CODEX_MIN_WINDOW_SIZE: [f32; 2] = [560.0, 640.0];
 const CODEX_WINDOW_GAP: f32 = 12.0;
@@ -72,17 +75,37 @@ impl ThemeChoice {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 struct UiPreferences {
     language: LanguageChoice,
     theme: ThemeChoice,
+    font_size_points: u8,
     auto_reset: bool,
+}
+
+impl Default for UiPreferences {
+    fn default() -> Self {
+        Self {
+            language: LanguageChoice::System,
+            theme: ThemeChoice::System,
+            font_size_points: UI_FONT_SIZE_DEFAULT_POINTS,
+            auto_reset: false,
+        }
+    }
 }
 
 impl UiPreferences {
     fn from_json(json: &str) -> Option<Self> {
-        serde_json::from_str(json).ok()
+        let mut preferences: Self = serde_json::from_str(json).ok()?;
+        preferences.font_size_points = preferences
+            .font_size_points
+            .clamp(UI_FONT_SIZE_MIN_POINTS, UI_FONT_SIZE_MAX_POINTS);
+        Some(preferences)
+    }
+
+    fn zoom_factor(self) -> f32 {
+        f32::from(self.font_size_points) / f32::from(UI_FONT_SIZE_DEFAULT_POINTS)
     }
 }
 
@@ -218,6 +241,7 @@ struct MonitorApp {
     display_mode: DisplayMode,
     preferences: UiPreferences,
     system_language: Language,
+    display_resize_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -273,6 +297,8 @@ impl MonitorApp {
             .and_then(UiPreferences::from_json)
             .unwrap_or_default();
         apply_preferences(&cc.egui_ctx, preferences, system_language);
+        let display_resize_pending =
+            (preferences.zoom_factor() - cc.egui_ctx.zoom_factor()).abs() > f32::EPSILON;
 
         let (snapshot, rx) = start_metrics_sampler();
         let (codex_control_tx, codex_rx) = start_codex_usage_sampler(preferences.auto_reset);
@@ -290,6 +316,7 @@ impl MonitorApp {
             display_mode: DisplayMode::Full,
             preferences,
             system_language,
+            display_resize_pending,
         }
     }
 
@@ -343,18 +370,19 @@ impl MonitorApp {
         );
         let desired_inner_size = screen_rect
             .map(|screen_rect| {
+                let available_width = (screen_rect.width() - CODEX_SCREEN_MARGIN * 2.0).max(1.0);
+                let available_height =
+                    (screen_rect.height() - chrome_estimate.y - CODEX_SCREEN_MARGIN * 2.0).max(1.0);
                 Vec2::new(
-                    CODEX_WINDOW_SIZE[0].min(
-                        (screen_rect.width() - CODEX_SCREEN_MARGIN * 2.0)
-                            .max(CODEX_MIN_WINDOW_SIZE[0]),
-                    ),
-                    CODEX_WINDOW_SIZE[1].min(
-                        (screen_rect.height() - chrome_estimate.y - CODEX_SCREEN_MARGIN * 2.0)
-                            .max(CODEX_MIN_WINDOW_SIZE[1]),
-                    ),
+                    CODEX_WINDOW_SIZE[0].min(available_width),
+                    CODEX_WINDOW_SIZE[1].min(available_height),
                 )
             })
             .unwrap_or_else(|| Vec2::new(CODEX_WINDOW_SIZE[0], CODEX_WINDOW_SIZE[1]));
+        let minimum_inner_size = Vec2::new(
+            CODEX_MIN_WINDOW_SIZE[0].min(desired_inner_size.x),
+            CODEX_MIN_WINDOW_SIZE[1].min(desired_inner_size.y),
+        );
         if self.codex_details_position.is_none()
             && let (Some(parent_rect), Some(screen_rect)) = (parent_rect, screen_rect)
         {
@@ -381,7 +409,7 @@ impl MonitorApp {
         let mut viewport_builder = egui::ViewportBuilder::default()
             .with_title(title)
             .with_inner_size(desired_inner_size)
-            .with_min_inner_size(CODEX_MIN_WINDOW_SIZE)
+            .with_min_inner_size(minimum_inner_size)
             .with_resizable(true)
             .with_window_level(egui::WindowLevel::AlwaysOnTop);
         if let Some(position) = self.codex_details_position {
@@ -490,6 +518,13 @@ impl eframe::App for MonitorApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.display_resize_pending
+            && (ui.ctx().zoom_factor() - self.preferences.zoom_factor()).abs() < 0.001
+        {
+            apply_display_mode_size(ui.ctx(), self.display_mode);
+            self.display_resize_pending = false;
+        }
+
         let language = self.preferences.language.resolve(self.system_language);
         let palette = Palette::for_theme(ui.ctx().theme());
         let rect = ui.max_rect();
@@ -536,8 +571,15 @@ impl eframe::App for MonitorApp {
                 }
             }
 
+            ui.add_space(8.0);
+            let previous_font_size = self.preferences.font_size_points;
             if draw_preferences(ui, &mut self.preferences, language) {
                 apply_preferences(ui.ctx(), self.preferences, self.system_language);
+                if self.preferences.font_size_points != previous_font_size {
+                    self.display_resize_pending = true;
+                    self.codex_details_position = None;
+                    self.codex_details_needs_exact_position = self.codex_details_open;
+                }
             }
 
             should_toggle_mode |= draw_remaining_toggle_space(ui);
@@ -720,6 +762,7 @@ fn rect_distance_squared(left: Rect, right: Rect) -> f32 {
 
 fn apply_preferences(ctx: &egui::Context, preferences: UiPreferences, system_language: Language) {
     ctx.set_theme(preferences.theme.egui_preference());
+    ctx.set_zoom_factor(preferences.zoom_factor());
     let title = match preferences.language.resolve(system_language) {
         Language::Japanese => APP_TITLE,
         Language::English => "System Monitor",
@@ -763,7 +806,7 @@ fn draw_preferences(
                 Language::English => "Theme",
             });
             egui::ComboBox::from_id_salt("theme_preference")
-                .width(70.0)
+                .width(66.0)
                 .selected_text(theme_choice_label(preferences.theme, language))
                 .show_ui(ui, |ui| {
                     for choice in [ThemeChoice::Light, ThemeChoice::Dark, ThemeChoice::System] {
@@ -774,6 +817,24 @@ fn draw_preferences(
                         );
                     }
                 });
+
+            ui.label(match language {
+                Language::Japanese => "文字",
+                Language::English => "Text",
+            });
+            ui.add_sized(
+                [58.0, 22.0],
+                egui::DragValue::new(&mut preferences.font_size_points)
+                    .range(UI_FONT_SIZE_MIN_POINTS..=UI_FONT_SIZE_MAX_POINTS)
+                    .speed(1.0)
+                    .fixed_decimals(0)
+                    .max_decimals(0)
+                    .suffix(" pt"),
+            )
+            .on_hover_text(match language {
+                Language::Japanese => "UI文字サイズ（10〜32 pt、1 pt刻み）",
+                Language::English => "UI text size (10–32 pt, 1 pt steps)",
+            });
         });
     });
     *preferences != previous
@@ -899,6 +960,7 @@ fn fxhash(text: &str) -> u64 {
 
 fn configure_style(ctx: &egui::Context) {
     ctx.set_theme(egui::ThemePreference::System);
+    ctx.options_mut(|options| options.zoom_with_keyboard = false);
 
     for theme in [egui::Theme::Dark, egui::Theme::Light] {
         let palette = Palette::for_theme(theme);
@@ -913,9 +975,13 @@ fn configure_style(ctx: &egui::Context) {
             TextStyle::Heading,
             FontId::new(18.0, FontFamily::Proportional),
         );
-        style
-            .text_styles
-            .insert(TextStyle::Body, FontId::new(13.0, FontFamily::Proportional));
+        style.text_styles.insert(
+            TextStyle::Body,
+            FontId::new(
+                f32::from(UI_FONT_SIZE_DEFAULT_POINTS),
+                FontFamily::Proportional,
+            ),
+        );
         style.text_styles.insert(
             TextStyle::Small,
             FontId::new(11.0, FontFamily::Proportional),
@@ -2578,12 +2644,13 @@ mod preference_tests {
         let preferences = UiPreferences {
             language: LanguageChoice::En,
             theme: ThemeChoice::Dark,
+            font_size_points: 21,
             auto_reset: true,
         };
         let json = serde_json::to_string(&preferences).expect("serialize preferences");
         assert_eq!(
             json,
-            r#"{"language":"en","theme":"dark","auto_reset":true}"#
+            r#"{"language":"en","theme":"dark","font_size_points":21,"auto_reset":true}"#
         );
         assert_eq!(UiPreferences::from_json(&json), Some(preferences));
         assert_eq!(
@@ -2591,9 +2658,21 @@ mod preference_tests {
             Some(UiPreferences {
                 language: LanguageChoice::En,
                 theme: ThemeChoice::Dark,
+                font_size_points: UI_FONT_SIZE_DEFAULT_POINTS,
                 auto_reset: false,
             })
         );
+        assert_eq!(
+            UiPreferences::from_json(r#"{"language":"en","theme":"dark","font_size_points":9}"#)
+                .map(|preferences| preferences.font_size_points),
+            Some(UI_FONT_SIZE_MIN_POINTS)
+        );
+        assert_eq!(
+            UiPreferences::from_json(r#"{"language":"en","theme":"dark","font_size_points":99}"#)
+                .map(|preferences| preferences.font_size_points),
+            Some(UI_FONT_SIZE_MAX_POINTS)
+        );
+        assert_eq!(UiPreferences::default().zoom_factor(), 1.0);
         assert_eq!(
             UiPreferences::from_json(r#"{"language":"xx","theme":"dark"}"#),
             None
