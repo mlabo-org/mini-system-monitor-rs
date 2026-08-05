@@ -253,6 +253,7 @@ struct MonitorApp {
     codex_details_open: bool,
     codex_details_position: Option<Pos2>,
     codex_details_needs_exact_position: bool,
+    codex_details_resize_pending: bool,
     display_mode: DisplayMode,
     preferences: UiPreferences,
     draft_font_size_points: u8,
@@ -330,6 +331,7 @@ impl MonitorApp {
             codex_details_open: false,
             codex_details_position: None,
             codex_details_needs_exact_position: false,
+            codex_details_resize_pending: false,
             display_mode: DisplayMode::Full,
             preferences,
             draft_font_size_points,
@@ -361,6 +363,7 @@ impl MonitorApp {
         self.codex_details_open = false;
         self.codex_details_position = None;
         self.codex_details_needs_exact_position = false;
+        self.codex_details_resize_pending = false;
     }
 
     fn toggle_codex_details(&mut self) {
@@ -418,7 +421,10 @@ impl MonitorApp {
         let mut close_requested = false;
         let mut actions = Vec::new();
         let mut measured_outer_size = None;
-        let needs_exact_position = self.codex_details_needs_exact_position;
+        let resize_ready = self.codex_details_resize_pending
+            && (ctx.zoom_factor() - self.preferences.zoom_factor()).abs() < 0.001;
+        let needs_exact_position =
+            self.codex_details_needs_exact_position && !self.codex_details_resize_pending;
         let viewport_id = egui::ViewportId::from_hash_of("codex_management_window");
         let title = match language {
             Language::Japanese => "Codex 管理",
@@ -452,6 +458,18 @@ impl MonitorApp {
                 &mut close_requested,
             );
         });
+
+        if resize_ready {
+            ctx.send_viewport_cmd_to(
+                viewport_id,
+                egui::ViewportCommand::MinInnerSize(minimum_inner_size),
+            );
+            ctx.send_viewport_cmd_to(
+                viewport_id,
+                egui::ViewportCommand::InnerSize(desired_inner_size),
+            );
+            self.codex_details_resize_pending = false;
+        }
 
         if close_requested {
             open = false;
@@ -603,6 +621,7 @@ impl eframe::App for MonitorApp {
                     self.display_resize_pending = true;
                     self.codex_details_position = None;
                     self.codex_details_needs_exact_position = self.codex_details_open;
+                    self.codex_details_resize_pending = self.codex_details_open;
                 }
             }
 
