@@ -15,11 +15,12 @@
 - CPU使用率
 - メモリ使用率と使用量・総容量（GiB）
 - 検出元を併記するApple Silicon SoC/PMU温度のベストエフォート取得
-- 通常表示とコンパクト表示
+- 常に最前面へ表示する通常表示とコンパクト表示
 - 日本語、英語、システム言語
 - ライト、ダーク、システムテーマ
+- 10〜32 ptで調整できるUI文字サイズ
 
-言語とテーマの設定は保存されます。表示モードはモニター画面から切り替えられます。
+言語、テーマ、文字サイズ、RESET自動使用の設定は保存されます。表示モードはモニター画面から切り替えられ、起動時は通常表示になります。
 
 ### Codex利用状況と操作
 
@@ -29,9 +30,25 @@
 - RESETクレジット数、並び順、説明、最短有効期限
 - macOSのシステムタイムゾーンによるRESETクレジットの正確な期限と相対時間
 - 週間残量が0%になった場合の任意のRESET自動使用
+- 独立したサイズ変更可能なCodex管理ウィンドウ
 - 手動更新、Codex利用状況ページ、OpenAIステータスへのリンク
 
 RESETの期限はCodexから絶対時刻として取得します。表示言語とは独立してmacOSのシステムタイムゾーン規則で変換するため、日本に設定されたMacでは `JST`、夏時間のある地域では期限日時に適用される略称とオフセットを表示します。ローカル変換が利用できない場合のみUTCへフォールバックします。
+
+## UIプレビュー
+
+利用枠とRESETの値はサインイン中のCodexアカウントによって異なります。次の画像は表示例です。
+
+### メインモニター
+
+<p>
+  <img src="docs/images/system-monitor-dark-ja.png" alt="ダークテーマ・日本語表示のMini System Monitor" width="360">
+  <img src="docs/images/system-monitor-light-en.png" alt="ライトテーマ・英語表示のMini System Monitor" width="360">
+</p>
+
+### Codex管理
+
+<img src="docs/images/codex-controls-dark-en.png" alt="ダークテーマ・英語表示のCodex管理ウィンドウ" width="520">
 
 ## Codex接続
 
@@ -99,7 +116,7 @@ Scripts/build-app.sh --output target/app
 open "target/app/Mini System Monitor.app"
 ```
 
-インストールする場合は、実行中の旧バージョンを終了してからmacOSのアプリケーションフォルダへ移動します。
+インストールする場合は、実行中の旧バージョンを終了してから、後述のsource-owned installerを使用します。
 
 アドホック署名はローカル利用向けです。他のユーザーへダウンロード可能なアプリとして配布する場合は、Apple Developer IDによる署名とnotarizationが必要です。
 
