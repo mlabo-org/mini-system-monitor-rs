@@ -19,12 +19,14 @@ app-server` interface and may need updates when Codex changes.
 - CPU usage
 - Memory usage and used/total GiB
 - Best-effort Apple Silicon SoC/PMU temperature with the detected source
-- Full and compact display modes
+- Always-on-top full and compact display modes
 - Japanese, English, or system language
 - Light, dark, or system theme
+- Adjustable UI text size from 10 to 32 pt
 
-The language and theme preferences are persisted. The display mode can be
-toggled from the monitor surface.
+The language, theme, text-size, and automatic RESET preferences are persisted.
+The display mode can be toggled from the monitor surface and starts in full mode
+on each launch.
 
 ### Codex usage and controls
 
@@ -34,6 +36,7 @@ toggled from the monitor surface.
 - RESET credit count, ordered inventory, descriptions, and nearest expiry
 - Exact RESET-credit expiry in the macOS system time zone plus relative time
 - Optional automatic RESET use when the weekly remaining quota reaches 0%
+- A separate, resizable Codex controls window
 - Manual refresh and links to Codex usage and OpenAI status
 
 RESET expiry timestamps are absolute values from Codex. The app converts them
@@ -41,6 +44,22 @@ with the macOS system time-zone rules, independently of the selected UI
 language. A Mac set to Japan therefore shows `JST`; zones with daylight saving
 time use the abbreviation and offset that apply to the expiry date. UTC is used
 only if local conversion is unavailable.
+
+## UI preview
+
+Quota and RESET values depend on the signed-in Codex account; the screenshots
+below show example states.
+
+### Main monitor
+
+<p>
+  <img src="docs/images/system-monitor-dark-ja.png" alt="Mini System Monitor in Japanese with the dark theme" width="360">
+  <img src="docs/images/system-monitor-light-en.png" alt="Mini System Monitor in English with the light theme" width="360">
+</p>
+
+### Codex controls
+
+<img src="docs/images/codex-controls-dark-en.png" alt="Codex controls window in English with the dark theme" width="520">
 
 ## Codex connection
 
@@ -126,8 +145,8 @@ Launch the built bundle with:
 open "target/app/Mini System Monitor.app"
 ```
 
-To install it, quit any running older copy and move the bundle into the macOS
-Applications folder.
+To install it, quit any running older copy and use the source-owned installer
+described below.
 
 The ad-hoc signature is intended for local use. Distributing a downloadable app
 to other users requires an Apple Developer ID signature and notarization.
