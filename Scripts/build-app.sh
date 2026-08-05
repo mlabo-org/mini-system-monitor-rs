@@ -38,7 +38,7 @@ done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd "$script_dir/.." && pwd -P)"
-build_root="${CARGO_TARGET_DIR:-$repo_root/target}"
+build_root="${CARGO_TARGET_DIR:-$repo_root/target/app-build}"
 case "$build_root" in
     /*) ;;
     *) build_root="$repo_root/$build_root" ;;
