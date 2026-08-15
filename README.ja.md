@@ -96,25 +96,36 @@ clone直後に、固定済みRust依存関係を一度取得します。
 cargo fetch --locked
 ```
 
-## ソースから実行
+## ビルド済みネイティブアプリを実行
+
+```bash
+Scripts/materialize-app.sh
+Scripts/run-app.sh
+```
+
+materializerはロック済み依存関係を使ったオフラインrelease build、アドホック署名、bundle検証を行い、安定したローカルruntimeである `dist/Mini System Monitor.app` をatomicに更新します。launcherはbundle executableの存在と実行権限を確認してからnative appを直接開き、Cargoや `target/` 内のbinaryを経由しません。
+
+bundle、または `dist/Mini System Monitor.app/Contents/MacOS/mini-system-monitor-rs` が存在しない、もしくは実行可能でない場合、`Scripts/run-app.sh` は正確なmaterialization手順を表示して停止します。`Scripts/materialize-app.sh` を再実行し、runtime fallbackとして `cargo run` や `target/` 内のbinaryを使わないでください。
+
+materializationはオフラインでbuildするため、fresh cloneでは先に `cargo fetch --locked` を一度実行してください。
+
+## 開発専用のソース実行
+
+Rust sourceを明示的に開発するときだけ、次のコマンドを使用できます。
 
 ```bash
 cargo run --locked
 ```
 
-## macOSアプリをビルド
+これは通常利用、インストール経路、または実行可能handoffの起動方法ではありません。
+
+## 任意のpackaging先へmacOSアプリをビルド
 
 ```bash
-Scripts/build-app.sh --output target/app
+Scripts/build-app.sh --output /path/to/package-output
 ```
 
-ロック済み依存関係を使ったオフラインreleaseビルドを行い、ソース管理されたアイコンとバンドル情報を使って、アドホック署名・検証済みの `target/app/Mini System Monitor.app` を生成します。出力先に同名アプリが存在していてはいけません。オフラインビルドのため、fresh cloneでは先に `cargo fetch --locked` を一度実行してください。
-
-生成したアプリは次のコマンドで起動できます。
-
-```bash
-open "target/app/Mini System Monitor.app"
-```
+ロック済み依存関係を使ったオフラインrelease buildを行い、ソース管理されたアイコンとbundle情報を使って、指定したpackaging directory配下にアドホック署名・検証済みの `Mini System Monitor.app` を生成します。出力先に同名アプリが存在していてはいけません。このコマンドはconstruction primitiveです。安定したローカルruntimeには `Scripts/materialize-app.sh` を使用してください。
 
 インストールする場合は、実行中の旧バージョンを終了してから、後述のsource-owned installerを使用します。
 
@@ -146,6 +157,8 @@ cargo test --locked
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --locked
 ```
+
+通常のpackaged runtimeを検証するときはmaterialize後の `dist/Mini System Monitor.app` にあるappまたはbundle executableを直接実行し、Cargoをruntime wrapperとして使いません。
 
 既存の `target/` によってCargoのfingerprint読み取りが停滞する場合は、対象コマンドだけ一時的なtargetディレクトリで実行します。
 

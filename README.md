@@ -122,28 +122,48 @@ Fetch the locked Rust dependencies once after cloning:
 cargo fetch --locked
 ```
 
-## Run from source
+## Run the prebuilt native app
+
+```bash
+Scripts/materialize-app.sh
+Scripts/run-app.sh
+```
+
+The materializer performs a locked, offline release build, ad-hoc signs and
+verifies the bundle, then atomically refreshes the stable local runtime at
+`dist/Mini System Monitor.app`. The launcher verifies that the bundle executable
+exists and is executable, then opens the native app directly. It does not invoke
+Cargo or use a binary under `target/`.
+
+If the bundle or `dist/Mini System Monitor.app/Contents/MacOS/mini-system-monitor-rs`
+is missing or not executable, `Scripts/run-app.sh` stops with the exact
+materialization action. Run `Scripts/materialize-app.sh` again; do not use
+`cargo run` or a `target/` binary as a runtime fallback.
+
+Because materialization builds offline, run `cargo fetch --locked` once first on
+a fresh clone.
+
+## Development-only source execution
+
+When explicitly developing the Rust source, this command is available:
 
 ```bash
 cargo run --locked
 ```
 
-## Build the macOS app
+This is not the normal user runtime, installed route, or runnable handoff.
+
+## Build a bundle at a custom packaging location
 
 ```bash
-Scripts/build-app.sh --output target/app
+Scripts/build-app.sh --output /path/to/package-output
 ```
 
 This performs a locked, offline release build and produces an ad-hoc signed and
-verified `target/app/Mini System Monitor.app` using the source-owned icon and
-bundle metadata. The destination app must not already exist. Because the build
-is offline, run `cargo fetch --locked` once first on a fresh clone.
-
-Launch the built bundle with:
-
-```bash
-open "target/app/Mini System Monitor.app"
-```
+verified `Mini System Monitor.app` below the requested packaging directory using
+the source-owned icon and bundle metadata. The destination app must not already
+exist. This command is a construction primitive; use `Scripts/materialize-app.sh`
+for the stable local runtime.
 
 To install it, quit any running older copy and use the source-owned installer
 described below.
@@ -183,6 +203,10 @@ cargo test --locked
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --locked
 ```
+
+When validating the normal packaged runtime, materialize it and execute the app
+or its bundle executable directly from `dist/Mini System Monitor.app`; do not
+use Cargo as the runtime wrapper.
 
 If the existing `target/` directory causes Cargo fingerprint reads to stall,
 run the affected command with a temporary target directory, for example:
