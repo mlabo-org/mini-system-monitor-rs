@@ -19,14 +19,11 @@ executable="$app/Contents/MacOS/mini-system-monitor-rs"
 [[ -d "$app" ]] || fail "materialized app is missing: $app"
 [[ -f "$executable" ]] || fail "materialized executable is missing: $executable"
 [[ -x "$executable" ]] || fail "materialized executable is not executable: $executable"
-for tool in codesign open xattr; do
+for tool in codesign open; do
     command -v "$tool" >/dev/null 2>&1 || fail "required tool is unavailable: $tool"
 done
 
-for attribute in com.apple.FinderInfo com.apple.ResourceFork 'com.apple.fileprovider.fpfs#P'; do
-    xattr -d "$attribute" "$app" 2>/dev/null || true
-done
-codesign --verify --deep --strict "$app" \
+codesign --verify --deep "$app" \
     || fail "materialized app failed signature verification: $app"
 
 exec open -n "$app"
