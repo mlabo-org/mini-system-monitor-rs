@@ -57,8 +57,7 @@ cleanup() {
 }
 trap cleanup EXIT INT HUP TERM
 
-CARGO_TARGET_DIR="$stage_dir/cargo-target" \
-    "$repo_root/Scripts/build-app.sh" --output "$stage_dir/output"
+"$repo_root/Scripts/build-app.sh" --output "$stage_dir/output"
 built_app="$stage_dir/output/Mini System Monitor.app"
 [[ -d "$built_app" ]] || fail "built app is missing: $built_app"
 
