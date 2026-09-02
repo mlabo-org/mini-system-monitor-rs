@@ -1782,6 +1782,8 @@ fn draw_codex_management(
         ui.add_space(10.0);
         draw_codex_activity(ui, state, language, palette);
         ui.add_space(8.0);
+        draw_codex_links(ui, language, palette);
+        ui.add_space(8.0);
 
         egui::ScrollArea::vertical()
             .id_salt("codex_management_scroll")
@@ -1792,8 +1794,6 @@ fn draw_codex_management(
                 draw_codex_controls_panel(ui, state, auto_reset, busy, language, palette, actions);
                 ui.add_space(10.0);
                 draw_reset_credits_panel(ui, state, language, palette);
-                ui.add_space(10.0);
-                draw_codex_links(ui, language, palette);
                 ui.add_space(4.0);
             });
     });
@@ -2615,7 +2615,7 @@ fn status_color(status: CodexUsageStatus, palette: Palette) -> Color32 {
 }
 
 fn draw_codex_links(ui: &mut egui::Ui, language: Language, palette: Palette) {
-    ui.horizontal_centered(|ui| {
+    ui.horizontal(|ui| {
         ui.hyperlink_to(
             RichText::new(match language {
                 Language::Japanese => "使用状況を開く",
@@ -2630,8 +2630,8 @@ fn draw_codex_links(ui: &mut egui::Ui, language: Language, palette: Palette) {
         ui.label(RichText::new(" / ").size(10.0).color(palette.text_subtle));
         ui.hyperlink_to(
             RichText::new(match language {
-                Language::Japanese => "ステータスページ",
-                Language::English => "Status page",
+                Language::Japanese => "ChatGPT 稼働状況",
+                Language::English => "ChatGPT status",
             })
             .size(12.0)
             .strong()
