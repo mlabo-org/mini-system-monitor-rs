@@ -152,19 +152,12 @@ Scripts/install-app.sh \
 ## 検証
 
 ```bash
-cargo fmt --check
-cargo test --locked
-cargo clippy --all-targets --all-features -- -D warnings
-cargo build --locked
+Scripts/check.sh
 ```
+
+検証スクリプトはformat、test、Clippy、development buildを専用の一時Cargo targetで実行します。成功、失敗、中断のいずれでも終了時に一時領域を削除するため、検証後にrepo直下の `target/` は残りません。
 
 通常のpackaged runtimeを検証するときはmaterialize後の `dist/Mini System Monitor.app` にあるappまたはbundle executableを直接実行し、Cargoをruntime wrapperとして使いません。
-
-既存の `target/` によってCargoのfingerprint読み取りが停滞する場合は、対象コマンドだけ一時的なtargetディレクトリで実行します。
-
-```bash
-CARGO_TARGET_DIR=/tmp/mini-system-monitor-rs-target cargo test --offline --locked
-```
 
 ## ライセンス
 

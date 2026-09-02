@@ -39,14 +39,13 @@
 
 ## Validation
 
-- Rust source を変更した場合、原則として次を実行する。
+- Rust source またはbuild scriptを変更した場合は、次のsource-owned検証経路を実行する。
 
 ```bash
-cargo fmt --check
-cargo test --locked
-cargo clippy --all-targets --all-features -- -D warnings
-cargo build --locked
+Scripts/check.sh
 ```
+
+- `Scripts/check.sh` はrepo外の専用一時ディレクトリにCargo targetを作成し、正常終了、エラー終了、SIGINTまたはSIGTERMによる中断のいずれでも終了処理で削除する。検証目的でrepo直下の `target/` を作成または再利用しない。
 
 - materializationまたは通常runtime経路が作業対象の場合は、`Scripts/materialize-app.sh` を実行し、`dist/Mini System Monitor.app` の署名、bundle executableの存在・実行権限、Cargoを介さない代表的な直接起動を一つの受け入れ束で確認する。
 - GUI 表示を変更した場合は、可能な範囲で起動確認とスクリーンショット確認を行う。画面ロック、権限、表示対象の制約で確認できない場合は、未検証範囲として報告する。

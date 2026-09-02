@@ -8,6 +8,7 @@ usage() {
         'Usage: Scripts/build-app.sh --output PATH' \
         '' \
         'Builds and ad-hoc signs PATH/Mini System Monitor.app.' \
+        'Uses a temporary Cargo target and removes it when the command exits.' \
         'The destination app must not already exist.'
 }
 
@@ -38,11 +39,6 @@ done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd "$script_dir/.." && pwd -P)"
-build_root="${CARGO_TARGET_DIR:-$repo_root/target/app-build}"
-case "$build_root" in
-    /*) ;;
-    *) build_root="$repo_root/$build_root" ;;
-esac
 case "$output" in
     /*) ;;
     *) output="$PWD/$output" ;;
@@ -57,6 +53,16 @@ for tool in cargo plutil codesign mktemp cp mv mkdir chmod; do
     command -v "$tool" >/dev/null 2>&1 || fail "required tool is unavailable: $tool"
 done
 
+work_dir="$(mktemp -d /private/tmp/mini-system-monitor-build.XXXXXX)"
+build_root="$work_dir/cargo-target"
+stage_app="$work_dir/Mini System Monitor.app"
+cleanup() {
+    if [[ -d "$work_dir" ]]; then
+        rm -rf -- "$work_dir"
+    fi
+}
+trap cleanup EXIT INT HUP TERM
+
 (
     cd "$repo_root"
     CARGO_TARGET_DIR="$build_root" cargo build --release --locked --offline
@@ -64,15 +70,6 @@ done
 
 executable="$build_root/release/mini-system-monitor-rs"
 [[ -x "$executable" ]] || fail "release executable is missing: $executable"
-
-stage_dir="$(mktemp -d /private/tmp/mini-system-monitor-app.XXXXXX)"
-stage_app="$stage_dir/Mini System Monitor.app"
-cleanup() {
-    if [[ -d "$stage_dir" ]]; then
-        rm -rf -- "$stage_dir"
-    fi
-}
-trap cleanup EXIT INT HUP TERM
 
 mkdir -p "$stage_app/Contents/MacOS" "$stage_app/Contents/Resources"
 cp "$repo_root/App/Info.plist" "$stage_app/Contents/Info.plist"

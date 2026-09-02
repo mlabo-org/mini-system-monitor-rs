@@ -198,22 +198,17 @@ changes the selected Applications directory and may require macOS permission.
 ## Validate
 
 ```bash
-cargo fmt --check
-cargo test --locked
-cargo clippy --all-targets --all-features -- -D warnings
-cargo build --locked
+Scripts/check.sh
 ```
+
+The check script runs formatting, tests, Clippy, and the development build in a
+dedicated temporary Cargo target directory. It removes that directory on
+success, failure, or interruption, so validation does not leave `target/` in
+the repository.
 
 When validating the normal packaged runtime, materialize it and execute the app
 or its bundle executable directly from `dist/Mini System Monitor.app`; do not
 use Cargo as the runtime wrapper.
-
-If the existing `target/` directory causes Cargo fingerprint reads to stall,
-run the affected command with a temporary target directory, for example:
-
-```bash
-CARGO_TARGET_DIR=/tmp/mini-system-monitor-rs-target cargo test --offline --locked
-```
 
 ## License
 
