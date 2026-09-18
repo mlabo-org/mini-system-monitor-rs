@@ -58,7 +58,12 @@ build_root="$work_dir/cargo-target"
 stage_app="$work_dir/Mini System Monitor.app"
 cleanup() {
     if [[ -d "$work_dir" ]]; then
-        rm -rf -- "$work_dir"
+        cargo clean --manifest-path "$repo_root/Cargo.toml" --target-dir "$build_root"
+        if [[ -d "$stage_app" ]]; then
+            find "$stage_app" -type f -delete
+            find "$stage_app" -depth -type d -exec rmdir {} \;
+        fi
+        rmdir "$work_dir"
     fi
 }
 trap cleanup EXIT INT HUP TERM
