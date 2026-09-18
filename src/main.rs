@@ -1,5 +1,6 @@
 mod codex_usage;
 mod metrics;
+mod token_usage;
 
 use std::{
     env, fs,
@@ -19,6 +20,7 @@ use eframe::egui::{
 };
 use metrics::{MetricsSampler, Snapshot};
 use serde::{Deserialize, Serialize};
+use token_usage::{TokenUsageSampler, TokenUsageState};
 
 const APP_TITLE: &str = "システムモニター";
 const PREFERENCES_STORAGE_KEY: &str = "mini-system-monitor-rs.ui-preferences.v1";
@@ -180,7 +182,7 @@ struct Palette {
     text_muted: Color32,
     text_subtle: Color32,
     codex_accent: Color32,
-    spark_accent: Color32,
+    token_accent: Color32,
     warning_amber: Color32,
     error_red: Color32,
     extreme_bg: Color32,
@@ -200,7 +202,7 @@ impl Palette {
                 text_muted: Color32::from_rgb(151, 161, 156),
                 text_subtle: Color32::from_rgb(104, 115, 110),
                 codex_accent: Color32::from_rgb(91, 159, 255),
-                spark_accent: Color32::from_rgb(246, 190, 82),
+                token_accent: Color32::from_rgb(246, 190, 82),
                 warning_amber: Color32::from_rgb(238, 170, 83),
                 error_red: Color32::from_rgb(236, 100, 95),
                 extreme_bg: Color32::from_rgb(12, 14, 17),
@@ -216,7 +218,7 @@ impl Palette {
                 text_muted: Color32::from_rgb(94, 106, 100),
                 text_subtle: Color32::from_rgb(128, 139, 133),
                 codex_accent: Color32::from_rgb(34, 103, 198),
-                spark_accent: Color32::from_rgb(169, 111, 14),
+                token_accent: Color32::from_rgb(169, 111, 14),
                 warning_amber: Color32::from_rgb(177, 112, 30),
                 error_red: Color32::from_rgb(196, 61, 57),
                 extreme_bg: Color32::from_rgb(240, 243, 239),
@@ -249,6 +251,8 @@ struct MonitorApp {
     last_update: Instant,
     codex_usage: CodexUsageState,
     codex_rx: Receiver<CodexUsageState>,
+    token_usage: Option<TokenUsageState>,
+    token_rx: Receiver<TokenUsageState>,
     codex_control_tx: Sender<CodexControl>,
     codex_details_open: bool,
     codex_details_position: Option<Pos2>,
@@ -327,6 +331,8 @@ impl MonitorApp {
             last_update: Instant::now(),
             codex_usage: CodexUsageState::loading(),
             codex_rx,
+            token_usage: None,
+            token_rx: start_token_usage_sampler(),
             codex_control_tx,
             codex_details_open: false,
             codex_details_position: None,
@@ -350,6 +356,9 @@ impl MonitorApp {
     fn receive_latest_codex_usage(&mut self) {
         while let Ok(codex_usage) = self.codex_rx.try_recv() {
             self.codex_usage = codex_usage;
+        }
+        while let Ok(token_usage) = self.token_rx.try_recv() {
+            self.token_usage = Some(token_usage);
         }
     }
 
@@ -416,6 +425,7 @@ impl MonitorApp {
         }
 
         let state = self.codex_usage.clone();
+        let token_usage = self.token_usage.clone();
         let auto_reset = self.preferences.auto_reset;
         let mut open = true;
         let mut close_requested = false;
@@ -452,6 +462,7 @@ impl MonitorApp {
             draw_codex_management(
                 ui,
                 &state,
+                token_usage.as_ref(),
                 auto_reset,
                 language,
                 &mut actions,
@@ -584,6 +595,7 @@ impl eframe::App for MonitorApp {
                     if draw_codex_usage_card(
                         ui,
                         &self.codex_usage,
+                        self.token_usage.as_ref(),
                         self.preferences.auto_reset,
                         self.codex_details_open,
                         language,
@@ -1125,6 +1137,20 @@ fn start_metrics_sampler() -> (Snapshot, Receiver<Snapshot>) {
     (initial, rx)
 }
 
+fn start_token_usage_sampler() -> Receiver<TokenUsageState> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut sampler = TokenUsageSampler::from_env();
+        loop {
+            if tx.send(sampler.sample(unix_now_seconds())).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
+    });
+    rx
+}
+
 fn start_codex_usage_sampler(
     auto_reset_enabled: bool,
 ) -> (Sender<CodexControl>, Receiver<CodexUsageState>) {
@@ -1501,6 +1527,7 @@ fn draw_metric_track(
 fn draw_codex_usage_card(
     ui: &mut egui::Ui,
     state: &CodexUsageState,
+    token_usage: Option<&TokenUsageState>,
     auto_reset: bool,
     details_open: bool,
     language: Language,
@@ -1551,7 +1578,7 @@ fn draw_codex_usage_card(
     ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
         ui.set_clip_rect(content_rect);
         ui.set_width(content_rect.width());
-        draw_codex_usage_content(ui, state.content.as_ref(), language, palette);
+        draw_codex_usage_content(ui, state.content.as_ref(), token_usage, language, palette);
     });
 
     let mut toggle_details = false;
@@ -1567,59 +1594,132 @@ fn draw_codex_usage_card(
 fn draw_codex_usage_content(
     ui: &mut egui::Ui,
     content: Option<&CodexUsageContent>,
+    token_usage: Option<&TokenUsageState>,
     language: Language,
     palette: Palette,
 ) {
-    ui.columns(2, |columns| match content {
-        Some(content) => {
-            draw_quota_section(
-                &mut columns[0],
-                Some(&content.codex),
-                "Codex",
-                None,
-                language,
-                palette.codex_accent,
-                palette,
-            );
-            draw_quota_section(
-                &mut columns[1],
-                content.spark.as_ref(),
-                "Spark",
-                Some(match language {
-                    Language::Japanese => "未検出",
-                    Language::English => "Not detected",
-                }),
-                language,
-                palette.spark_accent,
-                palette,
-            );
+    ui.columns(2, |columns| {
+        draw_quota_section(
+            &mut columns[0],
+            content.map(|content| &content.codex),
+            "Codex",
+            Some(match language {
+                Language::Japanese => "未取得",
+                Language::English => "Unavailable",
+            }),
+            language,
+            palette.codex_accent,
+            palette,
+        );
+        draw_token_usage_section(&mut columns[1], token_usage, language, palette);
+    });
+}
+
+fn abbreviated_tokens(tokens: u64) -> String {
+    match tokens {
+        0..=999 => tokens.to_string(),
+        1_000..=999_999 => format!("{:.2}K", tokens as f64 / 1_000.0),
+        1_000_000..=999_999_999 => format!("{:.2}M", tokens as f64 / 1_000_000.0),
+        _ => format!("{:.2}B", tokens as f64 / 1_000_000_000.0),
+    }
+}
+
+fn draw_token_usage_section(
+    ui: &mut egui::Ui,
+    state: Option<&TokenUsageState>,
+    language: Language,
+    palette: Palette,
+) {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 106.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let title = match language {
+        Language::Japanese => "トークン · 直近1時間",
+        Language::English => "Tokens · last hour",
+    };
+    painter.text(
+        rect.left_top(),
+        Align2::LEFT_TOP,
+        title,
+        FontId::proportional(12.0),
+        palette.text_main,
+    );
+
+    let totals = state.and_then(|state| state.totals.as_ref());
+    let total = totals
+        .map(|t| abbreviated_tokens(t.input.saturating_add(t.output)))
+        .unwrap_or_else(|| "--".to_owned());
+    painter.text(
+        rect.left_top() + Vec2::new(0.0, 23.0),
+        Align2::LEFT_TOP,
+        total,
+        FontId::proportional(26.0),
+        palette.token_accent,
+    );
+
+    let (detail, cache, note) = if let Some(t) = totals {
+        let hit = if t.input == 0 {
+            "--".to_owned()
+        } else {
+            format!("{:.0}%", t.cached_input as f64 / t.input as f64 * 100.0)
+        };
+        let input = abbreviated_tokens(t.input);
+        let output = abbreviated_tokens(t.output);
+        let cached = abbreviated_tokens(t.cached_input);
+        let partial = state.is_some_and(|s| s.partial);
+        match language {
+            Language::Japanese => (
+                format!("入力 {input} / 出力 {output}"),
+                format!("キャッシュ {cached} · {hit}"),
+                if partial {
+                    "このMac · 一部集計"
+                } else {
+                    "このMac"
+                },
+            ),
+            Language::English => (
+                format!("In {input} / Out {output}"),
+                format!("Cached {cached} · {hit}"),
+                if partial {
+                    "This Mac · partial"
+                } else {
+                    "This Mac"
+                },
+            ),
         }
-        None => {
-            draw_quota_section(
-                &mut columns[0],
-                None,
-                "Codex",
-                Some(match language {
-                    Language::Japanese => "未取得",
-                    Language::English => "Unavailable",
-                }),
-                language,
-                palette.codex_accent,
-                palette,
-            );
-            draw_quota_section(
-                &mut columns[1],
-                None,
-                "Spark",
-                Some(match language {
-                    Language::Japanese => "未検出",
-                    Language::English => "Not detected",
-                }),
-                language,
-                palette.spark_accent,
-                palette,
-            );
-        }
+    } else {
+        let label = match (state.is_some(), language) {
+            (false, Language::Japanese) => "集計中…",
+            (true, Language::Japanese) => "記録を取得できません",
+            (false, Language::English) => "Loading…",
+            (true, Language::English) => "Records unavailable",
+        };
+        (label.to_owned(), String::new(), "")
+    };
+    for (y, text, color) in [
+        (55.0, detail, palette.text_muted),
+        (73.0, cache, palette.text_muted),
+        (
+            91.0,
+            note.to_owned(),
+            if state.is_some_and(|s| s.partial) {
+                palette.warning_amber
+            } else {
+                palette.text_muted
+            },
+        ),
+    ] {
+        painter.text(
+            rect.left_top() + Vec2::new(0.0, y),
+            Align2::LEFT_TOP,
+            text,
+            FontId::proportional(10.5),
+            color,
+        );
+    }
+    response.on_hover_text(match language {
+        Language::Japanese => "このMacに保存されたCodex記録の直近60分。5秒ごとに集計します。\n合計 = 入力 + 出力。キャッシュは入力の内訳で、割合はキャッシュ入力 ÷ 全入力です（リクエスト単位のヒット率ではありません）。推論は出力に含まれます。\n記録時刻で集計するため、処理途中の使用量や他の端末・クラウドの使用量は含まれない場合があります。利用枠の消費率とは異なります。\n「一部集計」は読めない記録などがあり、集計が不完全な状態です。",
+        Language::English => "Last 60 minutes of Codex records stored on this Mac, refreshed every 5 seconds.\nTotal = input + output. Cached tokens are part of input; the percentage is cached input / all input, not a request-level hit rate. Reasoning is part of output.\nUses record timestamps; in-flight, other-device and cloud usage may be absent. This is not quota consumption.\nPartial means some records could not be counted completely.",
     });
 }
 
@@ -1714,6 +1814,7 @@ fn codex_details_toggle_tooltip(details_open: bool, language: Language) -> &'sta
 fn draw_codex_management(
     ui: &mut egui::Ui,
     state: &CodexUsageState,
+    token_usage: Option<&TokenUsageState>,
     auto_reset: bool,
     language: Language,
     actions: &mut Vec<CodexUiAction>,
@@ -1789,7 +1890,7 @@ fn draw_codex_management(
             .id_salt("codex_management_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                draw_codex_limits_panel(ui, state, language, palette);
+                draw_codex_limits_panel(ui, state, token_usage, language, palette);
                 ui.add_space(10.0);
                 draw_codex_controls_panel(ui, state, auto_reset, busy, language, palette, actions);
                 ui.add_space(10.0);
@@ -1802,6 +1903,7 @@ fn draw_codex_management(
 fn draw_codex_limits_panel(
     ui: &mut egui::Ui,
     state: &CodexUsageState,
+    token_usage: Option<&TokenUsageState>,
     language: Language,
     palette: Palette,
 ) {
@@ -1809,15 +1911,15 @@ fn draw_codex_limits_panel(
         ui.set_width(ui.available_width());
         ui.label(
             RichText::new(match language {
-                Language::Japanese => "現在の利用枠",
-                Language::English => "Current limits",
+                Language::Japanese => "利用枠とトークン",
+                Language::English => "Limits and tokens",
             })
             .size(14.0)
             .strong()
             .color(palette.text_main),
         );
         ui.add_space(5.0);
-        draw_codex_usage_content(ui, state.content.as_ref(), language, palette);
+        draw_codex_usage_content(ui, state.content.as_ref(), token_usage, language, palette);
     });
 }
 
