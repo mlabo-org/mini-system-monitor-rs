@@ -45,13 +45,17 @@ fi
 
 stage_dir="$(mktemp -d /private/tmp/mini-system-monitor-materialize.XXXXXX)"
 previous_app=""
+remove_stage() {
+    find "$stage_dir" -type f -delete
+    find "$stage_dir" -depth -type d -exec rmdir {} \;
+}
 cleanup() {
     status=$?
     if [[ "$status" -ne 0 && -n "$previous_app" && -e "$previous_app" && ! -e "$destination" ]]; then
         mv "$previous_app" "$destination" || true
     fi
     if [[ -d "$stage_dir" ]]; then
-        rm -rf -- "$stage_dir"
+        remove_stage
     fi
     exit "$status"
 }
@@ -81,4 +85,4 @@ printf 'Materialized and verified: %s\n' "$destination"
 printf 'Run directly: open %q\n' "$destination"
 
 trap - EXIT INT HUP TERM
-rm -rf -- "$stage_dir"
+remove_stage

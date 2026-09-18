@@ -16,7 +16,9 @@ done
 validation_root="$(mktemp -d /private/tmp/mini-system-monitor-check.XXXXXX)"
 cleanup() {
     if [[ -d "$validation_root" ]]; then
-        rm -rf -- "$validation_root"
+        cargo clean --manifest-path "$repo_root/Cargo.toml" \
+            --target-dir "$validation_root/cargo-target"
+        rmdir "$validation_root"
     fi
 }
 trap cleanup EXIT INT HUP TERM
