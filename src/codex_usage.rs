@@ -98,7 +98,6 @@ pub enum CodexUsageStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodexUsageContent {
     pub codex: QuotaBucket,
-    pub spark: Option<QuotaBucket>,
     pub reset_credits: ResetCreditInventory,
     pub service_tier: CodexServiceTier,
     pub fetched_at: i64,
@@ -692,7 +691,6 @@ struct RateLimitsResponse {
 #[serde(rename_all = "camelCase")]
 struct RateLimitSnapshot {
     limit_id: Option<String>,
-    limit_name: Option<String>,
     primary: Option<RateLimitWindow>,
     secondary: Option<RateLimitWindow>,
 }
@@ -732,34 +730,19 @@ fn parse_rate_limits_response(
     let response =
         serde_json::from_value::<RateLimitsResponse>(result).map_err(FetchError::Json)?;
 
-    let (codex_snapshot, spark_snapshot) = match response.rate_limits_by_limit_id.as_ref() {
-        Some(buckets) if !buckets.is_empty() => {
-            let codex = buckets
-                .iter()
-                .find(|(limit_id, bucket)| {
-                    limit_id.as_str() == "codex" || bucket.limit_id.as_deref() == Some("codex")
-                })
-                .map(|(_, bucket)| bucket.clone())
-                .unwrap_or_else(|| response.rate_limits.clone());
-            let spark = buckets
-                .values()
-                .find(|bucket| {
-                    bucket
-                        .limit_name
-                        .as_deref()
-                        .is_some_and(|name| name.to_ascii_lowercase().contains("spark"))
-                })
-                .cloned();
-            (codex, spark)
-        }
-        _ => (response.rate_limits.clone(), None),
+    let codex_snapshot = match response.rate_limits_by_limit_id.as_ref() {
+        Some(buckets) if !buckets.is_empty() => buckets
+            .iter()
+            .find(|(limit_id, bucket)| {
+                limit_id.as_str() == "codex" || bucket.limit_id.as_deref() == Some("codex")
+            })
+            .map(|(_, bucket)| bucket.clone())
+            .unwrap_or_else(|| response.rate_limits.clone()),
+        _ => response.rate_limits.clone(),
     };
 
     Ok(CodexUsageContent {
         codex: quota_bucket("Codex", &codex_snapshot, now_secs),
-        spark: spark_snapshot
-            .as_ref()
-            .map(|snapshot| quota_bucket("Spark", snapshot, now_secs)),
         reset_credits: reset_credit_inventory(response.rate_limit_reset_credits, now_secs),
         service_tier,
         fetched_at: now_secs,
@@ -1211,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_codex_and_spark_buckets_from_limit_id_map() {
+    fn selects_codex_bucket_from_limit_id_map() {
         let result = json!({
             "rateLimits": {
                 "limitId": "legacy",
@@ -1226,9 +1209,9 @@ mod tests {
                     "primary": { "usedPercent": 25, "windowDurationMins": 300, "resetsAt": 13_600 },
                     "secondary": { "usedPercent": 10, "windowDurationMins": 10080, "resetsAt": 96_400 }
                 },
-                "codex_bengalfox": {
-                    "limitId": "codex_bengalfox",
-                    "limitName": "GPT-5.3-Codex-Spark",
+                "other_limit": {
+                    "limitId": "other_limit",
+                    "limitName": "Other limit",
                     "primary": { "usedPercent": 40, "windowDurationMins": 300, "resetsAt": 10_030 },
                     "secondary": { "usedPercent": 70, "windowDurationMins": 10080, "resetsAt": 182_800 }
                 }
@@ -1240,21 +1223,10 @@ mod tests {
 
         assert_eq!(parsed.codex.five_hour.remaining_percent, Some(75));
         assert_eq!(parsed.codex.weekly.remaining_percent, Some(90));
-        assert_eq!(
-            parsed.spark.as_ref().map(|bucket| bucket.title.as_str()),
-            Some("Spark")
-        );
-        assert_eq!(
-            parsed
-                .spark
-                .as_ref()
-                .map(|bucket| bucket.five_hour.remaining_percent),
-            Some(Some(60))
-        );
     }
 
     #[test]
-    fn falls_back_to_single_rate_limits_without_inventing_spark() {
+    fn falls_back_to_single_rate_limits() {
         let result = json!({
             "rateLimits": {
                 "limitId": "codex",
@@ -1269,7 +1241,6 @@ mod tests {
 
         assert_eq!(parsed.codex.five_hour.remaining_percent, Some(88));
         assert_eq!(parsed.codex.weekly.remaining_percent, Some(66));
-        assert!(parsed.spark.is_none());
     }
 
     #[test]

@@ -31,7 +31,7 @@ on each launch.
 ### Codex usage and controls
 
 - Codex 5-hour and weekly remaining quota
-- Spark 5-hour and weekly quota when a Spark limit is returned
+- Last-hour local token total, input/output, cached input count and share
 - Standard/Fast service-tier display and selector
 - RESET credit count, ordered inventory, descriptions, and nearest expiry
 - Exact RESET-credit expiry in the macOS system time zone plus relative time
@@ -74,12 +74,31 @@ Normal refreshes read:
 
 The Codex poller runs separately from the system-metrics sampler, normally every
 60 seconds, and backs off after failures while retaining the last good result.
-If Spark is absent from `rateLimitsByLimitId`, the UI reports it as not detected
-instead of inventing a bucket.
 
 The app does not require an OpenAI API key and does not scrape web pages. It does
 require a working, signed-in local Codex installation whose app-server supports
 the methods above.
+
+### Last-hour tokens
+
+The token panel reads local session records under `CODEX_HOME` (default:
+`~/.codex`) and aggregates usage recorded within the rolling last 60 minutes,
+refreshing every 5 seconds. It works independently of account-quota polling and
+includes records from before monitor startup and archived tasks.
+
+- Total is input plus output. Cached input is part of input, and reasoning is part
+  of output; neither is added twice.
+- The cache percentage is cached input tokens divided by all input tokens, not
+  the percentage of requests hitting the cache. Zero input displays `--`.
+- Repeated notifications and historical usage copied into forks are not counted
+  twice.
+- Other-device, cloud and not-yet-recorded in-flight usage may be absent. These
+  numbers are not quota consumption or billed cost.
+- Incomplete readable data is marked “partial”; unavailable records display an
+  unavailable state, distinct from a successfully measured zero.
+
+Codex may change its local record format. The monitor does not modify the records
+or retain or transmit conversation text.
 
 ### Operations that change Codex state
 
