@@ -2,11 +2,11 @@
 
 [English](README.md) | [日本語](README.ja.md)
 
-`eframe/egui` と Rust で実装したmacOSネイティブのシステムモニターです。コンパクトなデスクトップウインドウに、ローカルのCPU・メモリ情報、Codex利用状況、サービスティア操作、RESETクレジット管理をまとめて表示します。
+`eframe/egui` と Rust で実装したmacOSネイティブのシステムモニターです。コンパクトなデスクトップウインドウに、ローカルのCPU・メモリ情報、CodexとClaude Codeの利用状況、Codexのサービスティア操作とRESETクレジット管理をまとめて表示します。利用状況のカードは、前面にあるChatGPT/CodexアプリかClaudeアプリに合わせて自動で切り替わり、どちらかに固定することもできます。
 
 ## プロジェクトの位置づけ
 
-本プロジェクトは独立した非公式ユーティリティであり、OpenAIとの提携やOpenAIによる承認を受けた製品ではありません。Codex連携はローカルの `codex app-server` インターフェースに依存するため、Codex側の変更に応じて更新が必要になる場合があります。
+本プロジェクトは独立した非公式ユーティリティであり、OpenAIやAnthropicとの提携や承認を受けた製品ではありません。Codex連携はローカルの `codex app-server` インターフェースに、Claude連携はローカルのClaude Code会話記録ファイルに依存するため、各ツール側の変更に応じて更新が必要になる場合があります。
 
 ## 機能
 
@@ -20,7 +20,24 @@
 - ライト、ダーク、システムテーマ
 - 10〜32 ptで調整できるUI文字サイズ
 
-言語、テーマ、文字サイズ、RESET自動使用の設定は保存されます。表示モードはモニター画面から切り替えられ、起動時は通常表示になります。
+言語、テーマ、文字サイズ、表示切り替え、RESET自動使用の設定は保存されます。表示モードはモニター画面から切り替えられ、起動時は通常表示になります。
+
+### CodexとClaudeの表示切り替え
+
+- 利用状況カードの下に `表示: 自動 / Codex / Claude` のスイッチ
+- 自動では前面のアプリに追従します。ChatGPT/CodexならCodex、ClaudeならClaudeを表示します
+- ターミナルなど他のアプリや、モニター自身が前面のときは直前の表示を保ちます
+- スイッチの横に、今の表示と「自動検知」か「固定」かを表示します
+- コンパクト表示の3列目も同じ表示に切り替わります
+
+判定は0.5秒ごとに前面アプリのバンドルIDを読むだけで、アクセシビリティ権限は不要です。ターミナルで `claude` や `codex` を使うときは前面がターミナルになるため、見たい方に固定してください。
+
+### Claude Codeの利用状況
+
+- 直近1時間と直近5時間のトークン合計
+- 入力・出力、キャッシュ読込と入力に占める割合、キャッシュ書込
+- ターミナルの `claude` とClaudeデスクトップアプリのCodeタブの両方が対象
+- Claudeの残りの利用枠は、取得できるローカルの仕組みがないため表示しません
 
 ### Codex利用状況と操作
 
@@ -37,13 +54,20 @@ RESETの期限はCodexから絶対時刻として取得します。表示言語�
 
 ## UIプレビュー
 
-利用枠とRESETの値はサインイン中のCodexアカウントによって異なります。次の画像は表示例です。
+利用枠、RESET、トークンの値はサインイン中のアカウントと手元の使用状況によって異なります。次の画像は表示例です。
 
-### メインモニター
+### Codex表示
 
 <p>
-  <img src="docs/images/system-monitor-dark-ja.png" alt="ダークテーマ・日本語表示のMini System Monitor" width="360">
-  <img src="docs/images/system-monitor-light-en.png" alt="ライトテーマ・英語表示のMini System Monitor" width="360">
+  <img src="docs/images/system-monitor-dark-ja.png" alt="自動検知でCodexを表示中、ダークテーマ・日本語表示" width="360">
+  <img src="docs/images/system-monitor-light-en.png" alt="自動検知でCodexを表示中、ライトテーマ・英語表示" width="360">
+</p>
+
+### Claude表示
+
+<p>
+  <img src="docs/images/claude-usage-dark-ja.png" alt="自動検知でClaudeを表示中、ダークテーマ・日本語表示" width="360">
+  <img src="docs/images/claude-usage-light-en.png" alt="自動検知でClaudeを表示中、ライトテーマ・英語表示" width="360">
 </p>
 
 ### Codex管理
@@ -88,6 +112,19 @@ RESETの自動使用は既定で**オフ**です。有効にした場合でも�
 
 条件を満たすクレジットのうち、有効期限が最も近いものを選択します。`~/Library/Application Support/mini-system-monitor-rs/codex-auto-reset.json` の冪等性ジャーナルにより、再試行や再起動による重複使用を防ぎます。
 
+## Claude Codeの利用記録
+
+Claude表示は、`CLAUDE_CONFIG_DIR`（未指定時は `~/.claude`）の `projects/**/*.jsonl` にあるClaude Codeの会話記録（サブエージェントの記録を含む）を読み取り、5秒ごとに集計します。2回目以降は追記された行だけを読みます。
+
+- APIの応答ごとに `usage` が記録されます。ストリーミングの応答は同じメッセージIDで複数行に書かれるため、メッセージIDごとに1回だけ数えます。
+- Claudeはキャッシュなしの入力、キャッシュ読込、キャッシュ書込を別々に記録します。表示する入力はこの3つの合計で、合計は入力＋出力です。
+- キャッシュの割合は「キャッシュ読込トークン数 ÷ 入力トークン数」です。「書込」はキャッシュ作成分の入力です。
+- 集計範囲は記録時刻による直近60分と直近5時間です。Claudeの利用枠の区切りとは異なり、残りの利用枠も表しません。
+- claude.ai、Claudeアプリの通常チャット、別端末の使用はローカルにClaude Codeの記録が残らないため含まれません。
+- 読めない記録や壊れた行がある場合は「一部集計」、記録フォルダがない場合は未取得として表示します。
+
+モニターは会話記録を変更せず、会話本文を保存・送信しません。
+
 ## 温度取得
 
 macOSでは、最初にprivate IOHIDセンサー経路を試し、次に `sysinfo` のコンポーネント、最後に利用可能な `osx-cpu-temp`、`istats`、`powermetrics` を時間制限付きで試します。これはApple SiliconのSoC/PMU系温度をベストエフォートで取得するもので、個別CPUコアの厳密な温度ではありません。有効な値を取得できない場合は `温度 --` / `Temp --` と表示します。
@@ -99,8 +136,9 @@ macOSでは、最初にprivate IOHIDセンサー経路を試し、次に `sysinf
 - ネイティブリンク、バンドル検証、署名に必要なXcode Command Line Tools
 - Codex機能を使う場合はCodex CLI、Codexアプリ、またはChatGPTアプリ
 - アカウント情報を取得する場合は認証済みCodexセッション
+- Claude機能を使う場合はClaude Code（ターミナル、またはClaudeデスクトップアプリのCodeタブ）
 
-Codexデータを取得できない場合でも、システムモニター部分は動作します。
+CodexやClaudeのデータを取得できない場合でも、システムモニター部分は動作します。
 
 clone直後に、固定済みRust依存関係を一度取得します。
 

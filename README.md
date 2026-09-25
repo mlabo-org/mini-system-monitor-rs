@@ -3,14 +3,17 @@
 [English](README.md) | [日本語](README.ja.md)
 
 Native macOS system monitor written in Rust with `eframe/egui`. It combines
-local CPU and memory metrics with Codex usage, service-tier controls, and RESET
-credit management in a compact desktop window.
+local CPU and memory metrics with Codex and Claude Code usage in a compact
+desktop window, plus Codex service-tier controls and RESET credit management.
+The usage card follows whichever of the ChatGPT/Codex or Claude apps is in
+front, or can be pinned to either one.
 
 ## Project status
 
 This is an independent, unofficial utility and is not affiliated with or
-endorsed by OpenAI. Its Codex integration depends on the local `codex
-app-server` interface and may need updates when Codex changes.
+endorsed by OpenAI or Anthropic. Its Codex integration depends on the local
+`codex app-server` interface, and its Claude integration reads local Claude Code
+transcript files; either may need updates when those tools change.
 
 ## Features
 
@@ -24,9 +27,29 @@ app-server` interface and may need updates when Codex changes.
 - Light, dark, or system theme
 - Adjustable UI text size from 10 to 32 pt
 
-The language, theme, text-size, and automatic RESET preferences are persisted.
+The language, theme, text-size, view, and automatic RESET preferences are
+persisted.
 The display mode can be toggled from the monitor surface and starts in full mode
 on each launch.
+
+### Codex and Claude views
+
+- `View: Auto / Codex / Claude` switch below the usage card
+- Auto follows the frontmost app: ChatGPT/Codex shows Codex, Claude shows Claude
+- Other apps (such as a terminal) and the monitor itself keep the previous view
+- The current view is shown next to the switch as detected or pinned
+- The compact mode's third column follows the same view
+
+Detection reads only the frontmost app's bundle identifier every 0.5 seconds and
+needs no Accessibility permission. When you use `claude` or `codex` in a
+terminal, the terminal is in front, so pin the view you want instead.
+
+### Claude Code usage
+
+- Rolling last-hour and last-5-hour token totals
+- Input/output, cache reads with their share of input, and cache writes
+- Counts both terminal `claude` and the Claude desktop app's Code tab
+- Remaining Claude quota is not shown, because no local interface provides it
 
 ### Codex usage and controls
 
@@ -47,14 +70,21 @@ only if local conversion is unavailable.
 
 ## UI preview
 
-Quota and RESET values depend on the signed-in Codex account; the screenshots
-below show example states.
+Quota, RESET, and token values depend on the signed-in account and local usage;
+the screenshots below show example states.
 
-### Main monitor
+### Codex view
 
 <p>
-  <img src="docs/images/system-monitor-dark-ja.png" alt="Mini System Monitor in Japanese with the dark theme" width="360">
-  <img src="docs/images/system-monitor-light-en.png" alt="Mini System Monitor in English with the light theme" width="360">
+  <img src="docs/images/system-monitor-dark-ja.png" alt="Codex view detected automatically, in Japanese with the dark theme" width="360">
+  <img src="docs/images/system-monitor-light-en.png" alt="Codex view detected automatically, in English with the light theme" width="360">
+</p>
+
+### Claude view
+
+<p>
+  <img src="docs/images/claude-usage-dark-ja.png" alt="Claude view detected automatically, in Japanese with the dark theme" width="360">
+  <img src="docs/images/claude-usage-light-en.png" alt="Claude view detected automatically, in English with the light theme" width="360">
 </p>
 
 ### Codex controls
@@ -117,6 +147,29 @@ The nearest-expiring eligible credit is selected. An idempotency journal at
 `~/Library/Application Support/mini-system-monitor-rs/codex-auto-reset.json`
 prevents duplicate consumption across retries or restarts.
 
+## Claude Code usage records
+
+The Claude view reads Claude Code transcripts under `CLAUDE_CONFIG_DIR` (default:
+`~/.claude`) in `projects/**/*.jsonl`, including subagent transcripts, and
+refreshes every 5 seconds. Only newly appended lines are read after the first
+pass.
+
+- Each API response records its own `usage`. A streamed response is written as
+  several lines with the same message ID, so each message ID is counted once.
+- Claude reports uncached input, cache reads, and cache writes separately. The
+  displayed input is their sum, and total is input plus output.
+- The cache percentage is cache-read tokens divided by all input tokens. `Write`
+  is cache-creation input.
+- The windows are rolling (last 60 minutes and last 5 hours by record time).
+  They are not Claude's quota windows and do not show remaining quota.
+- claude.ai, regular chats in the Claude app, and other devices leave no local
+  Claude Code transcript and are not counted.
+- Unreadable or malformed records are marked “partial”; a missing directory
+  displays an unavailable state.
+
+The monitor does not modify the transcripts or retain or transmit conversation
+text.
+
 ## Temperature behavior
 
 On macOS, temperature collection first tries the private IOHID sensor route,
@@ -132,8 +185,9 @@ temperature. If no valid source is available, the UI shows `温度 --` / `Temp -
 - Xcode Command Line Tools for native linking, bundle validation, and signing
 - A working Codex CLI, Codex app, or ChatGPT app for Codex usage features
 - An authenticated Codex session for account data
+- Claude Code (terminal or the Claude desktop app's Code tab) for Claude usage
 
-The system monitor continues to work when Codex data is unavailable.
+The system monitor continues to work when Codex or Claude data is unavailable.
 
 Fetch the locked Rust dependencies once after cloning:
 
