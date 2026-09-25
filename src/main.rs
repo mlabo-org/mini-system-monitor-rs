@@ -1,4 +1,6 @@
+mod claude_usage;
 mod codex_usage;
+mod frontmost;
 mod metrics;
 mod token_usage;
 
@@ -10,6 +12,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use claude_usage::{ClaudeUsageSampler, ClaudeUsageState};
 use codex_usage::{
     CodexActionKind, CodexActivity, CodexControl, CodexServiceTier, CodexUsageContent,
     CodexUsagePoller, CodexUsageState, CodexUsageStatus, QuotaBucket, QuotaWindow, ResetCredit,
@@ -18,6 +21,7 @@ use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect,
     RichText, Sense, Stroke, StrokeKind, TextStyle, Vec2,
 };
+use frontmost::Assistant;
 use metrics::{MetricsSampler, Snapshot};
 use serde::{Deserialize, Serialize};
 use token_usage::{TokenUsageSampler, TokenUsageState};
@@ -27,10 +31,11 @@ const PREFERENCES_STORAGE_KEY: &str = "mini-system-monitor-rs.ui-preferences.v1"
 const UI_FONT_SIZE_MIN_POINTS: u8 = 10;
 const UI_FONT_SIZE_MAX_POINTS: u8 = 32;
 const UI_FONT_SIZE_DEFAULT_POINTS: u8 = 16;
-const FULL_WINDOW_SIZE: [f32; 2] = [480.0, 448.0];
-const FULL_MIN_WINDOW_SIZE: [f32; 2] = [450.0, 428.0];
-const COMPACT_WINDOW_SIZE: [f32; 2] = [480.0, 188.0];
-const COMPACT_MIN_WINDOW_SIZE: [f32; 2] = [430.0, 168.0];
+const FULL_WINDOW_SIZE: [f32; 2] = [480.0, 476.0];
+const FULL_MIN_WINDOW_SIZE: [f32; 2] = [450.0, 456.0];
+const COMPACT_WINDOW_SIZE: [f32; 2] = [480.0, 216.0];
+const COMPACT_MIN_WINDOW_SIZE: [f32; 2] = [430.0, 196.0];
+const FRONTMOST_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CODEX_WINDOW_SIZE: [f32; 2] = [640.0, 820.0];
 const CODEX_MIN_WINDOW_SIZE: [f32; 2] = [560.0, 640.0];
 const CODEX_WINDOW_GAP: f32 = 12.0;
@@ -77,6 +82,27 @@ impl ThemeChoice {
     }
 }
 
+/// Which assistant's usage the main window shows. `Auto` follows the frontmost
+/// Codex or Claude app and keeps the last view while any other app is in front.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AssistantChoice {
+    #[default]
+    Auto,
+    Codex,
+    Claude,
+}
+
+impl AssistantChoice {
+    fn resolve(self, detected: Assistant) -> Assistant {
+        match self {
+            Self::Auto => detected,
+            Self::Codex => Assistant::Codex,
+            Self::Claude => Assistant::Claude,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 struct UiPreferences {
@@ -84,6 +110,7 @@ struct UiPreferences {
     theme: ThemeChoice,
     font_size_points: u8,
     auto_reset: bool,
+    assistant: AssistantChoice,
 }
 
 impl Default for UiPreferences {
@@ -93,6 +120,7 @@ impl Default for UiPreferences {
             theme: ThemeChoice::System,
             font_size_points: UI_FONT_SIZE_DEFAULT_POINTS,
             auto_reset: false,
+            assistant: AssistantChoice::Auto,
         }
     }
 }
@@ -182,6 +210,7 @@ struct Palette {
     text_muted: Color32,
     text_subtle: Color32,
     codex_accent: Color32,
+    claude_accent: Color32,
     token_accent: Color32,
     warning_amber: Color32,
     error_red: Color32,
@@ -202,6 +231,7 @@ impl Palette {
                 text_muted: Color32::from_rgb(151, 161, 156),
                 text_subtle: Color32::from_rgb(104, 115, 110),
                 codex_accent: Color32::from_rgb(91, 159, 255),
+                claude_accent: Color32::from_rgb(222, 136, 104),
                 token_accent: Color32::from_rgb(246, 190, 82),
                 warning_amber: Color32::from_rgb(238, 170, 83),
                 error_red: Color32::from_rgb(236, 100, 95),
@@ -218,6 +248,7 @@ impl Palette {
                 text_muted: Color32::from_rgb(94, 106, 100),
                 text_subtle: Color32::from_rgb(128, 139, 133),
                 codex_accent: Color32::from_rgb(34, 103, 198),
+                claude_accent: Color32::from_rgb(176, 84, 52),
                 token_accent: Color32::from_rgb(169, 111, 14),
                 warning_amber: Color32::from_rgb(177, 112, 30),
                 error_red: Color32::from_rgb(196, 61, 57),
@@ -253,6 +284,10 @@ struct MonitorApp {
     codex_rx: Receiver<CodexUsageState>,
     token_usage: Option<TokenUsageState>,
     token_rx: Receiver<TokenUsageState>,
+    claude_usage: Option<ClaudeUsageState>,
+    claude_rx: Receiver<ClaudeUsageState>,
+    detected_assistant: Assistant,
+    last_frontmost_check: Option<Instant>,
     codex_control_tx: Sender<CodexControl>,
     codex_details_open: bool,
     codex_details_position: Option<Pos2>,
@@ -319,8 +354,9 @@ impl MonitorApp {
             .unwrap_or_default();
         let draft_font_size_points = preferences.font_size_points;
         apply_preferences(&cc.egui_ctx, preferences, system_language);
-        let display_resize_pending =
-            (preferences.zoom_factor() - cc.egui_ctx.zoom_factor()).abs() > f32::EPSILON;
+        // Always size the window once at startup: eframe restores the last saved
+        // window size, which can predate a layout change.
+        let display_resize_pending = true;
 
         let (snapshot, rx) = start_metrics_sampler();
         let (codex_control_tx, codex_rx) = start_codex_usage_sampler(preferences.auto_reset);
@@ -333,6 +369,10 @@ impl MonitorApp {
             codex_rx,
             token_usage: None,
             token_rx: start_token_usage_sampler(),
+            claude_usage: None,
+            claude_rx: start_claude_usage_sampler(),
+            detected_assistant: Assistant::Codex,
+            last_frontmost_check: None,
             codex_control_tx,
             codex_details_open: false,
             codex_details_position: None,
@@ -360,6 +400,26 @@ impl MonitorApp {
         while let Ok(token_usage) = self.token_rx.try_recv() {
             self.token_usage = Some(token_usage);
         }
+        while let Ok(claude_usage) = self.claude_rx.try_recv() {
+            self.claude_usage = Some(claude_usage);
+        }
+    }
+
+    fn detect_frontmost_assistant(&mut self) {
+        if self
+            .last_frontmost_check
+            .is_some_and(|checked| checked.elapsed() < FRONTMOST_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.last_frontmost_check = Some(Instant::now());
+        if let Some(assistant) = frontmost::frontmost_assistant() {
+            self.detected_assistant = assistant;
+        }
+    }
+
+    fn assistant(&self) -> Assistant {
+        self.preferences.assistant.resolve(self.detected_assistant)
     }
 
     fn open_codex_details(&mut self) {
@@ -561,6 +621,7 @@ impl eframe::App for MonitorApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_latest_snapshot();
         self.receive_latest_codex_usage();
+        self.detect_frontmost_assistant();
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 
@@ -580,6 +641,7 @@ impl eframe::App for MonitorApp {
         painter.rect_filled(rect, 0.0, palette.panel_bg);
 
         let content_rect = rect.shrink2(Vec2::new(18.0, 15.0));
+        let assistant = self.assistant();
         let mut should_toggle_mode = draw_surface_toggle_targets(ui, rect, content_rect);
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
@@ -592,16 +654,28 @@ impl eframe::App for MonitorApp {
                     draw_system_card(ui, &self.snapshot, language, palette);
 
                     should_toggle_mode |= draw_toggle_space(ui, 10.0);
-                    if draw_codex_usage_card(
-                        ui,
-                        &self.codex_usage,
-                        self.token_usage.as_ref(),
-                        self.preferences.auto_reset,
-                        self.codex_details_open,
-                        language,
-                        palette,
-                    ) {
-                        self.toggle_codex_details();
+                    match assistant {
+                        Assistant::Codex => {
+                            if draw_codex_usage_card(
+                                ui,
+                                &self.codex_usage,
+                                self.token_usage.as_ref(),
+                                self.preferences.auto_reset,
+                                self.codex_details_open,
+                                language,
+                                palette,
+                            ) {
+                                self.toggle_codex_details();
+                            }
+                        }
+                        Assistant::Claude => {
+                            draw_claude_usage_card(
+                                ui,
+                                self.claude_usage.as_ref(),
+                                language,
+                                palette,
+                            );
+                        }
                     }
                 }
                 DisplayMode::Compact => {
@@ -609,7 +683,9 @@ impl eframe::App for MonitorApp {
                     if draw_compact_card(
                         ui,
                         &self.snapshot,
+                        assistant,
                         &self.codex_usage,
+                        self.claude_usage.as_ref(),
                         self.codex_details_open,
                         language,
                         palette,
@@ -620,6 +696,14 @@ impl eframe::App for MonitorApp {
             }
 
             ui.add_space(8.0);
+            draw_assistant_switch(
+                ui,
+                &mut self.preferences.assistant,
+                assistant,
+                language,
+                palette,
+            );
+            ui.add_space(4.0);
             let previous_font_size = self.preferences.font_size_points;
             if draw_preferences(
                 ui,
@@ -1151,6 +1235,20 @@ fn start_token_usage_sampler() -> Receiver<TokenUsageState> {
     rx
 }
 
+fn start_claude_usage_sampler() -> Receiver<ClaudeUsageState> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut sampler = ClaudeUsageSampler::from_env();
+        loop {
+            if tx.send(sampler.sample(unix_now_seconds())).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
+    });
+    rx
+}
+
 fn start_codex_usage_sampler(
     auto_reset_enabled: bool,
 ) -> (Sender<CodexControl>, Receiver<CodexUsageState>) {
@@ -1335,10 +1433,13 @@ fn draw_system_card(ui: &mut egui::Ui, snapshot: &Snapshot, language: Language, 
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_compact_card(
     ui: &mut egui::Ui,
     snapshot: &Snapshot,
+    assistant: Assistant,
     state: &CodexUsageState,
+    claude_usage: Option<&ClaudeUsageState>,
     details_open: bool,
     language: Language,
     palette: Palette,
@@ -1398,6 +1499,36 @@ fn draw_compact_card(
         },
         palette,
     );
+    if assistant == Assistant::Claude {
+        let hour = claude_usage.and_then(|usage| usage.last_hour.totals);
+        let five_hours = claude_usage.and_then(|usage| usage.last_five_hours.totals);
+        draw_compact_metric(
+            &painter,
+            codex_rect,
+            CompactMetricDisplay {
+                title: match language {
+                    Language::Japanese => "Claude 1時間",
+                    Language::English => "Claude 1h",
+                },
+                value: hour
+                    .map(|totals| abbreviated_tokens(totals.input.saturating_add(totals.output)))
+                    .unwrap_or_else(|| "--".to_owned()),
+                detail: format!(
+                    "5h {}",
+                    five_hours
+                        .map(|totals| abbreviated_tokens(
+                            totals.input.saturating_add(totals.output)
+                        ))
+                        .unwrap_or_else(|| "--".to_owned())
+                ),
+                percent: 0.0,
+                accent: palette.claude_accent,
+            },
+            palette,
+        );
+        return false;
+    }
+
     draw_compact_metric(
         &painter,
         codex_rect,
@@ -1611,7 +1742,13 @@ fn draw_codex_usage_content(
             palette.codex_accent,
             palette,
         );
-        draw_token_usage_section(&mut columns[1], token_usage, language, palette);
+        draw_token_usage_section(
+            &mut columns[1],
+            token_usage,
+            TokenSection::CodexHour,
+            language,
+            palette,
+        );
     });
 }
 
@@ -1624,19 +1761,52 @@ fn abbreviated_tokens(tokens: u64) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TokenSection {
+    CodexHour,
+    ClaudeHour,
+    ClaudeFiveHours,
+}
+
+impl TokenSection {
+    fn title(self, language: Language) -> &'static str {
+        match (self, language) {
+            (Self::CodexHour | Self::ClaudeHour, Language::Japanese) => "トークン · 直近1時間",
+            (Self::CodexHour | Self::ClaudeHour, Language::English) => "Tokens · last hour",
+            (Self::ClaudeFiveHours, Language::Japanese) => "トークン · 直近5時間",
+            (Self::ClaudeFiveHours, Language::English) => "Tokens · last 5 hours",
+        }
+    }
+
+    fn tooltip(self, language: Language) -> &'static str {
+        match (self, language) {
+            (Self::CodexHour, Language::Japanese) => {
+                "このMacに保存されたCodex記録の直近60分。5秒ごとに集計します。\n合計 = 入力 + 出力。キャッシュは入力の内訳で、割合はキャッシュ入力 ÷ 全入力です（リクエスト単位のヒット率ではありません）。推論は出力に含まれます。\n記録時刻で集計するため、処理途中の使用量や他の端末・クラウドの使用量は含まれない場合があります。利用枠の消費率とは異なります。\n「一部集計」は読めない記録などがあり、集計が不完全な状態です。"
+            }
+            (Self::CodexHour, Language::English) => {
+                "Last 60 minutes of Codex records stored on this Mac, refreshed every 5 seconds.\nTotal = input + output. Cached tokens are part of input; the percentage is cached input / all input, not a request-level hit rate. Reasoning is part of output.\nUses record timestamps; in-flight, other-device and cloud usage may be absent. This is not quota consumption.\nPartial means some records could not be counted completely."
+            }
+            (Self::ClaudeHour | Self::ClaudeFiveHours, Language::Japanese) => {
+                "このMacに保存されたClaude Code記録（ターミナルとデスクトップアプリのCodeタブ）の集計です。5秒ごとに更新します。\n合計 = 入力 + 出力。入力にはキャッシュ読込と書込を含み、割合はキャッシュ読込 ÷ 全入力です。「書込」はキャッシュ作成分です。\nclaude.ai やアプリの通常チャット、他の端末の使用量は含まれません。残りの利用枠や消費率ではありません。\n「一部集計」は読めない記録などがあり、集計が不完全な状態です。"
+            }
+            (Self::ClaudeHour | Self::ClaudeFiveHours, Language::English) => {
+                "Claude Code records stored on this Mac (terminal and the desktop app's Code tab), refreshed every 5 seconds.\nTotal = input + output. Input includes cache reads and writes; the percentage is cache reads / all input. \"Write\" is cache creation.\nclaude.ai and regular app chats and other devices are not included. This is not remaining quota or quota consumption.\nPartial means some records could not be counted completely."
+            }
+        }
+    }
+}
+
 fn draw_token_usage_section(
     ui: &mut egui::Ui,
     state: Option<&TokenUsageState>,
+    section: TokenSection,
     language: Language,
     palette: Palette,
 ) {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 106.0), Sense::hover());
     let painter = ui.painter_at(rect);
-    let title = match language {
-        Language::Japanese => "トークン · 直近1時間",
-        Language::English => "Tokens · last hour",
-    };
+    let title = section.title(language);
     painter.text(
         rect.left_top(),
         Align2::LEFT_TOP,
@@ -1667,24 +1837,28 @@ fn draw_token_usage_section(
         let output = abbreviated_tokens(t.output);
         let cached = abbreviated_tokens(t.cached_input);
         let partial = state.is_some_and(|s| s.partial);
+        let cache_write = state.and_then(|s| s.cache_write).map(abbreviated_tokens);
+        let place = match (partial, language) {
+            (false, Language::Japanese) => "このMac",
+            (true, Language::Japanese) => "このMac · 一部集計",
+            (false, Language::English) => "This Mac",
+            (true, Language::English) => "This Mac · partial",
+        };
+        let note = match (cache_write, language) {
+            (Some(write), Language::Japanese) => format!("書込 {write} · {place}"),
+            (Some(write), Language::English) => format!("Write {write} · {place}"),
+            (None, _) => place.to_owned(),
+        };
         match language {
             Language::Japanese => (
                 format!("入力 {input} / 出力 {output}"),
                 format!("キャッシュ {cached} · {hit}"),
-                if partial {
-                    "このMac · 一部集計"
-                } else {
-                    "このMac"
-                },
+                note,
             ),
             Language::English => (
                 format!("In {input} / Out {output}"),
                 format!("Cached {cached} · {hit}"),
-                if partial {
-                    "This Mac · partial"
-                } else {
-                    "This Mac"
-                },
+                note,
             ),
         }
     } else {
@@ -1694,14 +1868,14 @@ fn draw_token_usage_section(
             (false, Language::English) => "Loading…",
             (true, Language::English) => "Records unavailable",
         };
-        (label.to_owned(), String::new(), "")
+        (label.to_owned(), String::new(), String::new())
     };
     for (y, text, color) in [
         (55.0, detail, palette.text_muted),
         (73.0, cache, palette.text_muted),
         (
             91.0,
-            note.to_owned(),
+            note,
             if state.is_some_and(|s| s.partial) {
                 palette.warning_amber
             } else {
@@ -1717,9 +1891,161 @@ fn draw_token_usage_section(
             color,
         );
     }
-    response.on_hover_text(match language {
-        Language::Japanese => "このMacに保存されたCodex記録の直近60分。5秒ごとに集計します。\n合計 = 入力 + 出力。キャッシュは入力の内訳で、割合はキャッシュ入力 ÷ 全入力です（リクエスト単位のヒット率ではありません）。推論は出力に含まれます。\n記録時刻で集計するため、処理途中の使用量や他の端末・クラウドの使用量は含まれない場合があります。利用枠の消費率とは異なります。\n「一部集計」は読めない記録などがあり、集計が不完全な状態です。",
-        Language::English => "Last 60 minutes of Codex records stored on this Mac, refreshed every 5 seconds.\nTotal = input + output. Cached tokens are part of input; the percentage is cached input / all input, not a request-level hit rate. Reasoning is part of output.\nUses record timestamps; in-flight, other-device and cloud usage may be absent. This is not quota consumption.\nPartial means some records could not be counted completely.",
+    response.on_hover_text(section.tooltip(language));
+}
+
+fn draw_claude_usage_card(
+    ui: &mut egui::Ui,
+    usage: Option<&ClaudeUsageState>,
+    language: Language,
+    palette: Palette,
+) {
+    let available_width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(available_width, 194.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    painter.rect_filled(rect, 12.0, palette.card_bg);
+    painter.rect_stroke(
+        rect,
+        12.0,
+        Stroke::new(1.0, palette.card_stroke),
+        StrokeKind::Inside,
+    );
+
+    let inner = rect.shrink2(Vec2::new(15.0, 12.0));
+    painter.text(
+        inner.left_top(),
+        Align2::LEFT_TOP,
+        match language {
+            Language::Japanese => "Claude 使用量",
+            Language::English => "Claude usage",
+        },
+        FontId::proportional(14.0),
+        palette.text_main,
+    );
+    painter.text(
+        Pos2::new(inner.right(), inner.top() + 1.0),
+        Align2::RIGHT_TOP,
+        "Claude Code",
+        FontId::proportional(10.0),
+        palette.claude_accent,
+    );
+
+    let footer_height = 26.0;
+    let footer_rect = Rect::from_min_max(
+        Pos2::new(inner.left(), inner.bottom() - footer_height),
+        inner.right_bottom(),
+    );
+    let content_rect = Rect::from_min_max(
+        Pos2::new(inner.left(), inner.top() + 31.0),
+        Pos2::new(inner.right(), footer_rect.top() - 7.0),
+    );
+
+    ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
+        ui.set_clip_rect(content_rect);
+        ui.set_width(content_rect.width());
+        ui.columns(2, |columns| {
+            draw_token_usage_section(
+                &mut columns[0],
+                usage.map(|usage| &usage.last_hour),
+                TokenSection::ClaudeHour,
+                language,
+                palette,
+            );
+            draw_token_usage_section(
+                &mut columns[1],
+                usage.map(|usage| &usage.last_five_hours),
+                TokenSection::ClaudeFiveHours,
+                language,
+                palette,
+            );
+        });
+    });
+
+    // Laying out the footer in its own scope also returns the parent cursor to
+    // the card's bottom edge after the content scope moved it upward.
+    ui.scope_builder(egui::UiBuilder::new().max_rect(footer_rect), |ui| {
+        ui.set_clip_rect(footer_rect);
+        ui.set_width(footer_rect.width());
+        ui.horizontal_centered(|ui| {
+            ui.label(
+                RichText::new(match language {
+                    Language::Japanese => "残りの利用枠は取得できません（使用量のみ表示）",
+                    Language::English => "Remaining quota is unavailable (usage only)",
+                })
+                .size(10.5)
+                .color(palette.text_muted),
+            );
+        });
+    });
+}
+
+fn draw_assistant_switch(
+    ui: &mut egui::Ui,
+    choice: &mut AssistantChoice,
+    shown: Assistant,
+    language: Language,
+    palette: Palette,
+) {
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(4.0, 2.0);
+        ui.spacing_mut().button_padding = Vec2::new(8.0, 1.0);
+        ui.horizontal(|ui| {
+            ui.label(match language {
+                Language::Japanese => "表示",
+                Language::English => "View",
+            });
+            for (option, label, tooltip) in [
+                (
+                    AssistantChoice::Auto,
+                    match language {
+                        Language::Japanese => "自動",
+                        Language::English => "Auto",
+                    },
+                    match language {
+                        Language::Japanese => {
+                            "前面のアプリ（ChatGPT/Codex か Claude）に合わせて切り替えます。\nターミナルなど他のアプリが前面のときは直前の表示を保ちます。"
+                        }
+                        Language::English => {
+                            "Follows the frontmost app (ChatGPT/Codex or Claude).\nKeeps the previous view while another app, such as a terminal, is in front."
+                        }
+                    },
+                ),
+                (
+                    AssistantChoice::Codex,
+                    "Codex",
+                    match language {
+                        Language::Japanese => "Codex の表示に固定します",
+                        Language::English => "Always show Codex",
+                    },
+                ),
+                (
+                    AssistantChoice::Claude,
+                    "Claude",
+                    match language {
+                        Language::Japanese => "Claude の表示に固定します",
+                        Language::English => "Always show Claude",
+                    },
+                ),
+            ] {
+                ui.selectable_value(choice, option, label)
+                    .on_hover_text(tooltip);
+            }
+            let (name, color) = match shown {
+                Assistant::Codex => ("Codex", palette.codex_accent),
+                Assistant::Claude => ("Claude", palette.claude_accent),
+            };
+            ui.label(
+                RichText::new(match (*choice, language) {
+                    (AssistantChoice::Auto, Language::Japanese) => format!("· {name}（自動検知）"),
+                    (AssistantChoice::Auto, Language::English) => format!("· {name} (detected)"),
+                    (_, Language::Japanese) => format!("· {name}（固定）"),
+                    (_, Language::English) => format!("· {name} (pinned)"),
+                })
+                .size(11.0)
+                .color(color),
+            );
+        });
     });
 }
 
@@ -2864,11 +3190,12 @@ mod preference_tests {
             theme: ThemeChoice::Dark,
             font_size_points: 21,
             auto_reset: true,
+            assistant: AssistantChoice::Claude,
         };
         let json = serde_json::to_string(&preferences).expect("serialize preferences");
         assert_eq!(
             json,
-            r#"{"language":"en","theme":"dark","font_size_points":21,"auto_reset":true}"#
+            r#"{"language":"en","theme":"dark","font_size_points":21,"auto_reset":true,"assistant":"claude"}"#
         );
         assert_eq!(UiPreferences::from_json(&json), Some(preferences));
         assert_eq!(
@@ -2878,6 +3205,7 @@ mod preference_tests {
                 theme: ThemeChoice::Dark,
                 font_size_points: UI_FONT_SIZE_DEFAULT_POINTS,
                 auto_reset: false,
+                assistant: AssistantChoice::Auto,
             })
         );
         assert_eq!(
@@ -2894,6 +3222,22 @@ mod preference_tests {
         assert_eq!(
             UiPreferences::from_json(r#"{"language":"xx","theme":"dark"}"#),
             None
+        );
+    }
+
+    #[test]
+    fn assistant_choice_follows_detection_only_in_auto_mode() {
+        assert_eq!(
+            AssistantChoice::Auto.resolve(Assistant::Claude),
+            Assistant::Claude
+        );
+        assert_eq!(
+            AssistantChoice::Codex.resolve(Assistant::Claude),
+            Assistant::Codex
+        );
+        assert_eq!(
+            AssistantChoice::Claude.resolve(Assistant::Codex),
+            Assistant::Claude
         );
     }
 

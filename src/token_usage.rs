@@ -32,7 +32,7 @@ impl TokenTotals {
         })
     }
 
-    fn add(&mut self, other: Self) -> bool {
+    pub(crate) fn add(&mut self, other: Self) -> bool {
         let sum = (
             self.input.checked_add(other.input),
             self.cached_input.checked_add(other.cached_input),
@@ -49,6 +49,9 @@ impl TokenTotals {
 pub struct TokenUsageState {
     pub totals: Option<TokenTotals>,
     pub partial: bool,
+    /// Cache-write input tokens, reported separately only by providers which
+    /// bill them as a distinct part of input.
+    pub cache_write: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -147,6 +150,7 @@ impl TokenUsageSampler {
             return TokenUsageState {
                 totals: None,
                 partial: true,
+                cache_write: None,
             };
         };
         let cutoff = now_secs.saturating_sub(WINDOW);
@@ -214,6 +218,7 @@ impl TokenUsageSampler {
         TokenUsageState {
             totals: available.then_some(totals),
             partial: partial || !available,
+            cache_write: None,
         }
     }
 }
@@ -414,7 +419,7 @@ fn record_usage(cursor: &mut Cursor, row: Row, now: i64, events: &mut HashMap<Ev
 
 // RFC3339 UTC/offset timestamps, including the millisecond Z form emitted by
 // Codex. Integer seconds define the public sampler's time precision.
-fn timestamp_secs(text: &str) -> Option<i64> {
+pub(crate) fn timestamp_secs(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
     if bytes.len() < 20
         || bytes[4] != b'-'
