@@ -2820,23 +2820,39 @@ fn draw_quota_row(
     let painter = ui.painter_at(rect);
     let left = rect.left() + 1.0;
     let center_y = rect.center().y;
+    let label_font = FontId::proportional(11.0);
+    // Align both rows' values past the widest label ("Week" in English).
+    let label_column = painter
+        .layout_no_wrap(
+            localized_quota_label("週", language).to_owned(),
+            label_font.clone(),
+            palette.text_muted,
+        )
+        .size()
+        .x
+        .max(
+            painter
+                .layout_no_wrap(label.to_owned(), label_font.clone(), palette.text_muted)
+                .size()
+                .x,
+        );
 
     painter.text(
         Pos2::new(left, center_y),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(11.0),
+        label_font,
         palette.text_muted,
     );
-    painter.text(
-        Pos2::new(left + 28.0, center_y - 1.0),
+    let value_rect = painter.text(
+        Pos2::new(left + (label_column + 6.0).max(28.0), center_y - 1.0),
         Align2::LEFT_CENTER,
         remaining,
         FontId::proportional(21.0),
         palette.text_main,
     );
     painter.text(
-        Pos2::new(left + 78.0, center_y + 4.0),
+        Pos2::new(value_rect.right() + 3.0, center_y + 4.0),
         Align2::LEFT_CENTER,
         match language {
             Language::Japanese => "残",
