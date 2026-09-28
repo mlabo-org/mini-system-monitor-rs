@@ -1539,15 +1539,21 @@ fn draw_compact_card(
                     }
                     (None, _) => localized_status(claude_quota.status, language).to_owned(),
                 },
-                detail: match (bucket, language) {
-                    (Some(bucket), Language::Japanese) => {
+                detail: match (bucket, language, claude_quota.status) {
+                    (Some(bucket), Language::Japanese, CodexUsageStatus::Ready) => {
                         format!("週{}", bucket.weekly.remaining_text())
                     }
-                    (Some(bucket), Language::English) => {
+                    (Some(bucket), Language::English, CodexUsageStatus::Ready) => {
                         format!("W{}", bucket.weekly.remaining_text())
                     }
-                    (None, Language::Japanese) => "使用量 --".to_owned(),
-                    (None, Language::English) => "Usage --".to_owned(),
+                    (Some(bucket), Language::Japanese, _) => {
+                        format!("週{} 前回値", bucket.weekly.remaining_text())
+                    }
+                    (Some(bucket), Language::English, _) => {
+                        format!("W{} old", bucket.weekly.remaining_text())
+                    }
+                    (None, Language::Japanese, _) => "使用量 --".to_owned(),
+                    (None, Language::English, _) => "Usage --".to_owned(),
                 },
                 percent: bucket
                     .and_then(|bucket| {
@@ -1775,7 +1781,7 @@ fn draw_codex_usage_content(
                 Language::English => "Unavailable",
             }),
             language,
-            palette.codex_accent,
+            Some(palette.codex_accent),
             palette,
         );
         draw_token_usage_section(
@@ -1992,7 +1998,7 @@ fn draw_claude_usage_card(
                     Language::English => "Unavailable",
                 }),
                 language,
-                palette.claude_accent,
+                (quota.status == CodexUsageStatus::Ready).then_some(palette.claude_accent),
                 palette,
             );
             draw_token_usage_section(
@@ -2018,14 +2024,18 @@ fn draw_claude_usage_card(
                     language,
                 ))
                 .size(10.5)
-                .color(palette.text_muted),
+                .color(if quota.status == CodexUsageStatus::Ready {
+                    palette.text_muted
+                } else {
+                    status_color(quota.status, palette)
+                }),
             )
             .on_hover_text(match language {
                 Language::Japanese => {
-                    "Claude Codeがキーチェーンに保存したログイン情報で、非公開の利用状況APIから5時間枠と週枠を3分ごとに取得します。\nこのアプリはログイン情報を更新・保存しません。期限切れのときは claude を起動すると更新されます。"
+                    "Claude Codeがキーチェーンに保存したログイン情報で、非公開の利用状況APIから5時間枠と週枠を3分ごとに取得します。\nこのアプリはログイン情報を更新・保存しません。デスクトップアプリ内のClaude Codeはこれを更新しないため、期限切れのときは裏でターミナル版の claude（~/.local/bin/claude）を実行して更新させます。取得できない間の値は薄く表示します。"
                 }
                 Language::English => {
-                    "Fetched every 3 minutes from an undocumented usage API with the sign-in Claude Code keeps in the keychain.\nThis app never refreshes or stores the sign-in; when it has expired, starting claude renews it."
+                    "Fetched every 3 minutes from an undocumented usage API with the sign-in Claude Code keeps in the keychain.\nThis app never refreshes or stores the sign-in. Claude Code inside the desktop app does not renew it either, so when it has expired, the terminal claude (~/.local/bin/claude) is run in the background to renew it. Values fade while they cannot be fetched."
                 }
             });
             if let Some(error) = &quota.error {
@@ -2044,10 +2054,10 @@ fn claude_quota_error_text(error: &ClaudeQuotaError, language: Language) -> Stri
         (ClaudeQuotaError::SignedOut, Language::Japanese) => "Claude Code未ログイン".to_owned(),
         (ClaudeQuotaError::SignedOut, Language::English) => "Claude Code signed out".to_owned(),
         (ClaudeQuotaError::TokenExpired, Language::Japanese) => {
-            "ログイン期限切れ · claudeを起動".to_owned()
+            "ログイン期限切れ · 自動更新を待機".to_owned()
         }
         (ClaudeQuotaError::TokenExpired, Language::English) => {
-            "Sign-in expired · start claude".to_owned()
+            "Sign-in expired · renewing".to_owned()
         }
         (ClaudeQuotaError::Rejected, Language::Japanese) => "認証を拒否されました".to_owned(),
         (ClaudeQuotaError::Rejected, Language::English) => "Sign-in rejected".to_owned(),
@@ -2729,7 +2739,9 @@ fn draw_quota_section(
     title: &str,
     missing_label: Option<&str>,
     language: Language,
-    accent: Color32,
+    // `None` fades values kept from an earlier fetch, so they are not
+    // mistaken for the current quota.
+    accent: Option<Color32>,
     palette: Palette,
 ) {
     ui.set_width(ui.available_width());
@@ -2776,7 +2788,7 @@ fn draw_quota_window_row(
     ui: &mut egui::Ui,
     window: &QuotaWindow,
     language: Language,
-    accent: Color32,
+    accent: Option<Color32>,
     palette: Palette,
 ) {
     draw_quota_row(
@@ -2796,15 +2808,7 @@ fn draw_empty_quota_window_row(
     language: Language,
     palette: Palette,
 ) {
-    draw_quota_row(
-        ui,
-        label,
-        "--",
-        "--",
-        language,
-        palette.text_subtle,
-        palette,
-    );
+    draw_quota_row(ui, label, "--", "--", language, None, palette);
 }
 
 fn draw_quota_row(
@@ -2813,9 +2817,13 @@ fn draw_quota_row(
     remaining: &str,
     reset: &str,
     language: Language,
-    accent: Color32,
+    accent: Option<Color32>,
     palette: Palette,
 ) {
+    let (value_color, accent) = match accent {
+        Some(accent) => (palette.text_main, accent),
+        None => (palette.text_subtle, palette.text_subtle),
+    };
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::hover());
     let painter = ui.painter_at(rect);
     let left = rect.left() + 1.0;
@@ -2849,7 +2857,7 @@ fn draw_quota_row(
         Align2::LEFT_CENTER,
         remaining,
         FontId::proportional(21.0),
-        palette.text_main,
+        value_color,
     );
     painter.text(
         Pos2::new(value_rect.right() + 3.0, center_y + 4.0),
@@ -2954,9 +2962,11 @@ fn last_updated_text(fetched_at: Option<i64>, language: Language) -> String {
     let age = unix_now_seconds().saturating_sub(fetched_at).max(0);
     match language {
         Language::Japanese if age < 60 => format!("最終更新 {age}秒前"),
-        Language::Japanese => format!("最終更新 {}分前", age / 60),
+        Language::Japanese if age < 3600 => format!("最終更新 {}分前", age / 60),
+        Language::Japanese => format!("最終更新 {}時間{}分前", age / 3600, age % 3600 / 60),
         Language::English if age < 60 => format!("Last updated {age}s ago"),
-        Language::English => format!("Last updated {}m ago", age / 60),
+        Language::English if age < 3600 => format!("Last updated {}m ago", age / 60),
+        Language::English => format!("Last updated {}h {}m ago", age / 3600, age % 3600 / 60),
     }
 }
 

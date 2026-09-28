@@ -2,20 +2,29 @@
 //!
 //! Claude Code keeps its OAuth credentials in the macOS login keychain. The
 //! poller borrows that access token for each request, keeps it only in memory,
-//! and never refreshes or stores it; an expired token waits until Claude Code
-//! itself refreshes it. `api/oauth/usage` is undocumented and may change. The
-//! token reaches curl through stdin, so it never appears in process arguments.
+//! and never refreshes or stores it. Claude Code started from the desktop app
+//! does not renew that token, so when it has expired the poller runs the
+//! terminal `claude` CLI once in the background and lets Claude Code renew and
+//! store it. `api/oauth/usage` is undocumented and may change. The token
+//! reaches curl through stdin, so it never appears in process arguments.
 
 use crate::codex_usage::{CodexUsageStatus, QuotaBucket, QuotaWindow, format_reset_countdown};
 use crate::token_usage::timestamp_secs;
 use serde::Deserialize;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SECURITY: &str = "/usr/bin/security";
 const CURL: &str = "/usr/bin/curl";
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+/// The native installer's link under the home directory; GUI apps do not
+/// inherit the shell PATH.
+const CLAUDE_CLI: &str = ".local/bin/claude";
+const RENEW_TIMEOUT: Duration = Duration::from_secs(30);
+// Bounds CLI launches when a run does not renew the token.
+const RENEW_COOLDOWN: Duration = Duration::from_secs(600);
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA_HEADER: &str = "anthropic-beta: oauth-2025-04-20";
 const USER_AGENT: &str = concat!("mini-system-monitor-rs/", env!("CARGO_PKG_VERSION"));
@@ -23,6 +32,9 @@ const REQUEST_TIMEOUT_SECS: &str = "10";
 // The endpoint answers 429 to aggressive polling; quota moves slowly anyway.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(180);
 const MAX_BACKOFF: Duration = Duration::from_secs(900);
+// A missing or expired token is detected from the keychain alone, so the
+// poller rechecks it often to pick up Claude Code's refresh promptly.
+const KEYCHAIN_RECHECK_INTERVAL: Duration = Duration::from_secs(30);
 const FIVE_HOURS_MINS: i64 = 300;
 const WEEKLY_MINS: i64 = 10_080;
 
@@ -82,11 +94,18 @@ impl ClaudeQuotaError {
     fn is_auth_related(&self) -> bool {
         matches!(self, Self::SignedOut | Self::TokenExpired | Self::Rejected)
     }
+
+    /// Found before any request reaches the server.
+    fn is_local(&self) -> bool {
+        matches!(self, Self::SignedOut | Self::TokenExpired)
+    }
 }
 
 #[derive(Default)]
 pub struct ClaudeQuotaPoller {
     failures: u32,
+    awaiting_token: bool,
+    last_renew: Option<Instant>,
     last_good: Option<ClaudeQuota>,
 }
 
@@ -96,9 +115,10 @@ impl ClaudeQuotaPoller {
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs() as i64)
             .unwrap_or_default();
-        match fetch_quota(now_secs) {
+        match self.fetch_renewing_token(now_secs) {
             Ok(quota) => {
                 self.failures = 0;
+                self.awaiting_token = false;
                 self.last_good = Some(quota.clone());
                 ClaudeQuotaState {
                     status: CodexUsageStatus::Ready,
@@ -107,7 +127,10 @@ impl ClaudeQuotaPoller {
                 }
             }
             Err(error) => {
-                self.failures = self.failures.saturating_add(1);
+                self.awaiting_token = error.is_local();
+                if !self.awaiting_token {
+                    self.failures = self.failures.saturating_add(1);
+                }
                 let status = match (&self.last_good, error.is_auth_related()) {
                     (Some(_), false) => CodexUsageStatus::Stale,
                     _ => CodexUsageStatus::Unavailable,
@@ -121,7 +144,26 @@ impl ClaudeQuotaPoller {
         }
     }
 
+    fn fetch_renewing_token(&mut self, now_secs: i64) -> Result<ClaudeQuota, ClaudeQuotaError> {
+        let result = fetch_quota(now_secs);
+        let renew_due = self
+            .last_renew
+            .is_none_or(|last| last.elapsed() >= RENEW_COOLDOWN);
+        if result != Err(ClaudeQuotaError::TokenExpired) || !renew_due {
+            return result;
+        }
+        self.last_renew = Some(Instant::now());
+        if renew_token_with_claude_cli() {
+            fetch_quota(now_secs)
+        } else {
+            result
+        }
+    }
+
     pub fn next_delay(&self) -> Duration {
+        if self.awaiting_token {
+            return KEYCHAIN_RECHECK_INTERVAL;
+        }
         if self.failures == 0 {
             return REFRESH_INTERVAL;
         }
@@ -189,6 +231,37 @@ fn read_access_token(now_secs: i64) -> Result<String, ClaudeQuotaError> {
         .access_token
         .filter(|token| !token.is_empty())
         .ok_or(ClaudeQuotaError::SignedOut)
+}
+
+/// Runs `claude auth status`, which makes Claude Code renew an expired access
+/// token and store it in the keychain. Returns whether the CLI exited
+/// successfully within the timeout.
+fn renew_token_with_claude_cli() -> bool {
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
+    };
+    let Ok(mut child) = Command::new(std::path::Path::new(&home).join(CLAUDE_CLI))
+        .args(["auth", "status"])
+        .current_dir(&home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + RENEW_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(200)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 fn request_usage(token: &str) -> Result<String, ClaudeQuotaError> {
@@ -311,5 +384,7 @@ mod tests {
         assert_eq!(poller.next_delay(), REFRESH_INTERVAL * 2);
         poller.failures = 10;
         assert_eq!(poller.next_delay(), MAX_BACKOFF);
+        poller.awaiting_token = true;
+        assert_eq!(poller.next_delay(), KEYCHAIN_RECHECK_INTERVAL);
     }
 }
