@@ -14,14 +14,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-pub const SHORT_WINDOW: i64 = 60 * 60;
-pub const LONG_WINDOW: i64 = 5 * 60 * 60;
-
-#[derive(Clone, Debug)]
-pub struct ClaudeUsageState {
-    pub last_hour: TokenUsageState,
-    pub last_five_hours: TokenUsageState,
-}
+const WINDOW: i64 = 60 * 60;
 
 #[derive(Deserialize)]
 struct Row {
@@ -94,19 +87,15 @@ impl ClaudeUsageSampler {
         }
     }
 
-    pub fn sample(&mut self, now_secs: i64) -> ClaudeUsageState {
-        let unavailable = || TokenUsageState {
-            totals: None,
-            partial: true,
-            cache_write: None,
-        };
+    pub fn sample(&mut self, now_secs: i64) -> TokenUsageState {
         let Some(home) = &self.home else {
-            return ClaudeUsageState {
-                last_hour: unavailable(),
-                last_five_hours: unavailable(),
+            return TokenUsageState {
+                totals: None,
+                partial: true,
+                cache_write: None,
             };
         };
-        let cutoff = now_secs.saturating_sub(LONG_WINDOW);
+        let cutoff = now_secs.saturating_sub(WINDOW);
         self.events.retain(|_, event| event.at > cutoff);
 
         let mut files = Vec::new();
@@ -144,36 +133,29 @@ impl ClaudeUsageSampler {
         self.cursors.retain(|id, _| present.contains(id));
 
         let available = accessible && (attempted == 0 || readable > 0 || !self.events.is_empty());
-        let window = |length: i64| {
-            let start = now_secs.saturating_sub(length);
-            let mut totals = TokenTotals::default();
-            let mut cache_write = 0_u64;
-            let mut overflow = false;
-            for event in self.events.values() {
-                if event.at > start && event.at <= now_secs {
-                    let usage = event.usage;
-                    let input = usage
-                        .input_tokens
-                        .checked_add(usage.cache_read_input_tokens)
-                        .and_then(|sum| sum.checked_add(usage.cache_creation_input_tokens));
-                    overflow |= input.is_none();
-                    overflow |= !totals.add(TokenTotals {
-                        input: input.unwrap_or(u64::MAX),
-                        cached_input: usage.cache_read_input_tokens,
-                        output: usage.output_tokens,
-                    });
-                    cache_write = cache_write.saturating_add(usage.cache_creation_input_tokens);
-                }
+        let mut totals = TokenTotals::default();
+        let mut cache_write = 0_u64;
+        let mut overflow = false;
+        for event in self.events.values() {
+            if event.at > cutoff && event.at <= now_secs {
+                let usage = event.usage;
+                let input = usage
+                    .input_tokens
+                    .checked_add(usage.cache_read_input_tokens)
+                    .and_then(|sum| sum.checked_add(usage.cache_creation_input_tokens));
+                overflow |= input.is_none();
+                overflow |= !totals.add(TokenTotals {
+                    input: input.unwrap_or(u64::MAX),
+                    cached_input: usage.cache_read_input_tokens,
+                    output: usage.output_tokens,
+                });
+                cache_write = cache_write.saturating_add(usage.cache_creation_input_tokens);
             }
-            TokenUsageState {
-                totals: available.then_some(totals),
-                partial: partial || overflow || !available,
-                cache_write: available.then_some(cache_write),
-            }
-        };
-        ClaudeUsageState {
-            last_hour: window(SHORT_WINDOW),
-            last_five_hours: window(LONG_WINDOW),
+        }
+        TokenUsageState {
+            totals: available.then_some(totals),
+            partial: partial || overflow || !available,
+            cache_write: available.then_some(cache_write),
         }
     }
 }
@@ -233,7 +215,7 @@ fn read_changes(
         let row: Row = match serde_json::from_slice(&line) {
             Ok(row) => row,
             Err(_) => {
-                cursor.partial_until = now.saturating_add(LONG_WINDOW);
+                cursor.partial_until = now.saturating_add(WINDOW);
                 continue;
             }
         };
@@ -248,10 +230,10 @@ fn read_changes(
             continue;
         }
         let Some(at) = row.timestamp.as_deref().and_then(timestamp_secs) else {
-            cursor.partial_until = now.saturating_add(LONG_WINDOW);
+            cursor.partial_until = now.saturating_add(WINDOW);
             continue;
         };
-        if at <= now.saturating_sub(LONG_WINDOW) {
+        if at <= now.saturating_sub(WINDOW) {
             continue;
         }
         events
@@ -325,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_rows_count_once_and_windows_split_by_time() {
+    fn streamed_rows_count_once_and_old_rows_are_excluded() {
         let fixture = Fixture::new();
         fixture.append(
             "a.jsonl",
@@ -342,24 +324,16 @@ mod tests {
             &[assistant("s1", "2020-09-19T11:55:00Z", [3, 0, 7, 4])],
         );
         let state = fixture.sampler().sample(now());
-        assert!(!state.last_hour.partial);
+        assert!(!state.partial);
         assert_eq!(
-            state.last_hour.totals,
+            state.totals,
             Some(TokenTotals {
                 input: 2 + 100 + 50 + 3 + 7,
                 cached_input: 100,
                 output: 14,
             })
         );
-        assert_eq!(state.last_hour.cache_write, Some(57));
-        assert_eq!(
-            state.last_five_hours.totals,
-            Some(TokenTotals {
-                input: 162 + 1001,
-                cached_input: 1100,
-                output: 19,
-            })
-        );
+        assert_eq!(state.cache_write, Some(57));
     }
 
     #[test]
@@ -370,7 +344,7 @@ mod tests {
             &[assistant("m1", "2020-09-19T11:30:00Z", [1, 0, 0, 1])],
         );
         let mut sampler = fixture.sampler();
-        assert_eq!(sampler.sample(now()).last_hour.totals.unwrap().output, 1);
+        assert_eq!(sampler.sample(now()).totals.unwrap().output, 1);
         fixture.append(
             "a.jsonl",
             &[
@@ -378,10 +352,9 @@ mod tests {
                 assistant("m2", "2020-09-19T11:40:00Z", [1, 0, 0, 2]),
             ],
         );
-        assert_eq!(sampler.sample(now()).last_hour.totals.unwrap().output, 3);
+        assert_eq!(sampler.sample(now()).totals.unwrap().output, 3);
         let later = sampler.sample(now() + 3600);
-        assert_eq!(later.last_hour.totals, Some(TokenTotals::default()));
-        assert_eq!(later.last_five_hours.totals.unwrap().output, 3);
+        assert_eq!(later.totals, Some(TokenTotals::default()));
     }
 
     #[test]
@@ -389,14 +362,14 @@ mod tests {
         let fixture = Fixture::new();
         let mut missing = fixture.sampler();
         missing.home = Some(fixture.0.join("absent"));
-        assert!(missing.sample(now()).last_hour.totals.is_none());
+        assert!(missing.sample(now()).totals.is_none());
         fs::write(
             fixture.0.join("projects/-repo/b.jsonl"),
             b"{\"usage\": invalid}\n",
         )
         .unwrap();
         let state = fixture.sampler().sample(now());
-        assert!(state.last_hour.partial);
-        assert_eq!(state.last_hour.totals, Some(TokenTotals::default()));
+        assert!(state.partial);
+        assert_eq!(state.totals, Some(TokenTotals::default()));
     }
 }

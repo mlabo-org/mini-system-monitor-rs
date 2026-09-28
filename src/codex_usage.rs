@@ -1114,7 +1114,7 @@ fn remaining_percent(used_percent: i32) -> u8 {
     (100 - used_percent).clamp(0, 100) as u8
 }
 
-fn format_reset_countdown(resets_at: Option<i64>, now_secs: i64) -> String {
+pub(crate) fn format_reset_countdown(resets_at: Option<i64>, now_secs: i64) -> String {
     match resets_at {
         Some(resets_at) if resets_at <= now_secs => "まもなく".to_owned(),
         Some(resets_at) => {
