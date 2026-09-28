@@ -22,6 +22,9 @@ const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// The native installer's link under the home directory; GUI apps do not
 /// inherit the shell PATH.
 const CLAUDE_CLI: &str = ".local/bin/claude";
+// A token this close to expiry is treated as expired: the endpoint answers an
+// expired token with long 429s rather than an auth error.
+const EXPIRY_MARGIN_SECS: i64 = 60;
 const RENEW_TIMEOUT: Duration = Duration::from_secs(30);
 // Bounds CLI launches when a run does not renew the token.
 const RENEW_COOLDOWN: Duration = Duration::from_secs(600);
@@ -221,10 +224,12 @@ fn read_access_token(now_secs: i64) -> Result<String, ClaudeQuotaError> {
     let keychain: Keychain =
         serde_json::from_slice(&output.stdout).map_err(|_| ClaudeQuotaError::SignedOut)?;
     let oauth = keychain.oauth.ok_or(ClaudeQuotaError::SignedOut)?;
-    if oauth
-        .expires_at
-        .is_some_and(|expires_at| expires_at <= now_secs.saturating_mul(1000))
-    {
+    if oauth.expires_at.is_some_and(|expires_at| {
+        expires_at
+            <= now_secs
+                .saturating_add(EXPIRY_MARGIN_SECS)
+                .saturating_mul(1000)
+    }) {
         return Err(ClaudeQuotaError::TokenExpired);
     }
     oauth
