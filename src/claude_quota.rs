@@ -3,31 +3,29 @@
 //! Claude Code keeps its OAuth credentials in the macOS login keychain. The
 //! poller borrows that access token for each request, keeps it only in memory,
 //! and never refreshes or stores it. Claude Code started from the desktop app
-//! does not renew that token, so when it has expired the poller runs the
-//! terminal `claude` CLI once in the background and lets Claude Code renew and
-//! store it. `api/oauth/usage` is undocumented and may change. The token
-//! reaches curl through stdin, so it never appears in process arguments.
+//! does not renew that token, so when it has expired the poller hands the
+//! renewal to the terminal `claude` CLI (see `claude_renew`).
+//! `api/oauth/usage` is undocumented and may change. The token reaches curl
+//! through stdin, so it never appears in process arguments.
 
+use crate::claude_renew;
 use crate::codex_usage::{CodexUsageStatus, QuotaBucket, QuotaWindow, format_reset_countdown};
 use crate::token_usage::timestamp_secs;
 use serde::Deserialize;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SECURITY: &str = "/usr/bin/security";
 const CURL: &str = "/usr/bin/curl";
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
-/// The native installer's link under the home directory; GUI apps do not
-/// inherit the shell PATH.
-const CLAUDE_CLI: &str = ".local/bin/claude";
 // A token this close to expiry is treated as expired: the endpoint answers an
 // expired token with long 429s rather than an auth error.
 const EXPIRY_MARGIN_SECS: i64 = 60;
-const RENEW_TIMEOUT: Duration = Duration::from_secs(30);
-// Bounds CLI launches when a run does not renew the token.
-const RENEW_COOLDOWN: Duration = Duration::from_secs(600);
+// After a renewal, and the cap for retries after runs that renewed nothing
+// (which start at the short cooldown and double), as in CodexBar.
+const RENEW_COOLDOWN: Duration = Duration::from_secs(300);
+const RENEW_RETRY_COOLDOWN: Duration = Duration::from_secs(20);
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA_HEADER: &str = "anthropic-beta: oauth-2025-04-20";
 const USER_AGENT: &str = concat!("mini-system-monitor-rs/", env!("CARGO_PKG_VERSION"));
@@ -109,6 +107,7 @@ pub struct ClaudeQuotaPoller {
     failures: u32,
     awaiting_token: bool,
     last_renew: Option<Instant>,
+    renew_cooldown: Duration,
     last_good: Option<ClaudeQuota>,
 }
 
@@ -151,14 +150,17 @@ impl ClaudeQuotaPoller {
         let result = fetch_quota(now_secs);
         let renew_due = self
             .last_renew
-            .is_none_or(|last| last.elapsed() >= RENEW_COOLDOWN);
+            .is_none_or(|last| last.elapsed() >= self.renew_cooldown);
         if result != Err(ClaudeQuotaError::TokenExpired) || !renew_due {
             return result;
         }
         self.last_renew = Some(Instant::now());
-        if renew_token_with_claude_cli() {
+        if claude_renew::renew(read_keychain_item) {
+            self.renew_cooldown = RENEW_COOLDOWN;
             fetch_quota(now_secs)
         } else {
+            self.renew_cooldown =
+                (self.renew_cooldown * 2).clamp(RENEW_RETRY_COOLDOWN, RENEW_COOLDOWN);
             result
         }
     }
@@ -211,18 +213,21 @@ fn fetch_quota(now_secs: i64) -> Result<ClaudeQuota, ClaudeQuotaError> {
     Ok(quota_from_usage(usage, now_secs))
 }
 
-fn read_access_token(now_secs: i64) -> Result<String, ClaudeQuotaError> {
+/// Claude Code's credentials item, or `None` when it cannot be read.
+fn read_keychain_item() -> Option<Vec<u8>> {
     let output = Command::new(SECURITY)
         .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
-        .map_err(|_| ClaudeQuotaError::Failed("keychain unavailable".to_owned()))?;
-    if !output.status.success() {
-        return Err(ClaudeQuotaError::SignedOut);
-    }
+        .ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+fn read_access_token(now_secs: i64) -> Result<String, ClaudeQuotaError> {
+    let item = read_keychain_item().ok_or(ClaudeQuotaError::SignedOut)?;
     let keychain: Keychain =
-        serde_json::from_slice(&output.stdout).map_err(|_| ClaudeQuotaError::SignedOut)?;
+        serde_json::from_slice(&item).map_err(|_| ClaudeQuotaError::SignedOut)?;
     let oauth = keychain.oauth.ok_or(ClaudeQuotaError::SignedOut)?;
     if oauth.expires_at.is_some_and(|expires_at| {
         expires_at
@@ -236,37 +241,6 @@ fn read_access_token(now_secs: i64) -> Result<String, ClaudeQuotaError> {
         .access_token
         .filter(|token| !token.is_empty())
         .ok_or(ClaudeQuotaError::SignedOut)
-}
-
-/// Runs `claude auth status`, which makes Claude Code renew an expired access
-/// token and store it in the keychain. Returns whether the CLI exited
-/// successfully within the timeout.
-fn renew_token_with_claude_cli() -> bool {
-    let Some(home) = std::env::var_os("HOME") else {
-        return false;
-    };
-    let Ok(mut child) = Command::new(std::path::Path::new(&home).join(CLAUDE_CLI))
-        .args(["auth", "status"])
-        .current_dir(&home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return false;
-    };
-    let deadline = Instant::now() + RENEW_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(200)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-        }
-    }
 }
 
 fn request_usage(token: &str) -> Result<String, ClaudeQuotaError> {

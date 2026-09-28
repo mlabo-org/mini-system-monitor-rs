@@ -1,4 +1,5 @@
 mod claude_quota;
+mod claude_renew;
 mod claude_usage;
 mod codex_usage;
 mod frontmost;

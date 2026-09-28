@@ -116,9 +116,10 @@ RESETの自動使用は既定で**オフ**です。有効にした場合でも�
 残量は、ほかのオープンソースのClaude利用状況モニターと同じ `https://api.anthropic.com/api/oauth/usage` から取得します。これはAnthropicの公開APIに含まれない非公開のエンドポイントで、いつ変わったり使えなくなったりしてもおかしくありません。第三者のツールから呼ぶことが利用規約で認められているかも確認できていません。自己責任で使ってください。
 
 - アクセストークンは、Claude Codeがログインキーチェーンに保存しているもの（`Claude Code-credentials`）を、取得の直前に `/usr/bin/security` で読みます。
-- トークンは標準入力で `/usr/bin/curl` に渡すため、プロセスの引数には現れません。メモリ上にだけ置き、ログやファイルへの書き出しや更新はしません。
-- 期限切れのトークンは使いません。`claude` を起動するとClaude Codeが更新します。
-- 3分ごとに取得し、失敗したときは前回の値を残したまま最大15分まで間隔を延ばします。リセットまでの残り時間は手元で更新します。
+- トークンは標準入力で `/usr/bin/curl` に渡すため、プロセスの引数には現れません。メモリ上にだけ置き、ログやファイルへは書き出しません。リフレッシュトークンをこのアプリが使うこともありません。
+- 期限まで1分を切ったトークンは使いません。デスクトップアプリ内のClaude Codeはこのキーチェーンのトークンを更新しないため、CodexBarと同じくClaude Codeに更新を任せます。専用フォルダ（`~/Library/Application Support/mini-system-monitor-rs/claude-probe`）で `~/.local/bin/claude` を仮想ターミナルの中で起動して `/status` を開き、Claude Codeにトークンを更新・保存させます。キーチェーンが実際に書き換わったときだけ成功とみなし、書き換わらなければ20秒後から最大5分まで間隔を倍にして再試行します。
+- この `claude` はツール、MCPサーバー、フック、Remote Control、自動アップデートを使わずに起動し、会話記録は削除します。初回はそのフォルダに限って、Claude Codeのフォルダ信頼の確認に「はい」と答えます。
+- 3分ごとに取得し、サーバー側で失敗したときは最大15分まで間隔を延ばします。トークンがない・期限切れの間は30秒ごとにキーチェーンを確認します。前回取得した値は薄く表示します。リセットまでの残り時間は手元で更新します。
 - 表示するのは5時間枠（`five_hour`）と週間枠（`seven_day`）だけです。
 
 ## Claude Codeの利用記録
@@ -225,7 +226,9 @@ Claudeの残量表示は、次のオープンソースプロジェクトが見�
 - [@hamin-apple](https://github.com/hamin-apple) さんの [claude-usage-bar](https://github.com/hamin-apple/claude-usage-bar)：Claude Codeがキーチェーンに保存したトークンで利用状況APIを呼ぶ方法と、トークンをメモリにだけ置いて更新しないという慎重な扱い方
 - [@cmenesese](https://github.com/cmenesese) さんの [claudecodeusage](https://github.com/cmenesese/claudecodeusage)：キーチェーンと利用状況APIを使う経路と、APIに負担をかけない取得間隔
 
-これらのプロジェクトからコードはコピーしていません。このrepoでは同じ方法をRustで実装し直しています。お二人の公開があったからこそ、この機能を作れました。
+- [@steipete](https://github.com/steipete) さんの [CodexBar](https://github.com/steipete/CodexBar)：期限切れになったClaude Codeのログインを、仮想ターミナル内の `claude` の `/status` を通してClaude Code自身に更新させる方法と、キーチェーンの書き換わりで成功を確かめるやり方、起動オプションと再試行の間隔
+
+claude-usage-barとclaudecodeusageからコードはコピーしていません。このrepoでは同じ方法をRustで実装し直しています。`src/claude_renew.rs` のログイン更新は、CodexBarの委任リフレッシュをRustに移植したものです（Copyright (c) 2026 Peter Steinberger、MIT License）。皆さんの公開があったからこそ、この機能を作れました。
 
 ## ライセンス
 
