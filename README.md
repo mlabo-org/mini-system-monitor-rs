@@ -160,10 +160,23 @@ at your own risk.
   (`Claude Code-credentials`), read with `/usr/bin/security` right before each
   request.
 - The token is passed to `/usr/bin/curl` on stdin, so it never appears in process
-  arguments. It is kept only in memory and never logged, written, or refreshed.
-- An expired token is not used. Starting `claude` lets Claude Code renew it.
+  arguments. It is kept only in memory and never logged or written, and the app
+  never uses the refresh token itself.
+- A token within a minute of expiry is not used. Claude Code inside the desktop
+  app does not renew this keychain token, so the app hands the renewal to
+  Claude Code, as CodexBar does: it starts `~/.local/bin/claude` in a
+  pseudo-terminal inside its own folder
+  (`~/Library/Application Support/mini-system-monitor-rs/claude-probe`), opens
+  `/status`, and lets Claude Code renew and store the token. The run counts as a
+  renewal only when the keychain item actually changes; otherwise it is retried
+  after 20 seconds, doubling up to 5 minutes.
+- That `claude` run has no tools, MCP servers, hooks, Remote Control, or
+  auto-update, and its session transcript is deleted. On the first run it
+  answers Claude Code's folder-trust question with yes for that folder only.
 - The quota is fetched every 3 minutes, backing off up to 15 minutes after
-  failures while keeping the last good result. Reset countdowns update locally.
+  server-side failures. While the token is missing or expired, the keychain is
+  rechecked every 30 seconds. Values kept from an earlier fetch are shown faded.
+  Reset countdowns update locally.
 - Only the 5-hour (`five_hour`) and weekly (`seven_day`) windows are shown.
 
 ## Claude Code usage records
@@ -316,8 +329,17 @@ worked out and documented openly. Many thanks to their authors for sharing it:
   [@cmenesese](https://github.com/cmenesese) — the keychain and usage-endpoint
   route, and a polling interval gentle on the endpoint
 
-No code was copied from these projects; this repository reimplements the
-approach in Rust. Their work made this feature possible.
+- [CodexBar](https://github.com/steipete/CodexBar) by
+  [@steipete](https://github.com/steipete) — handing an expired Claude Code
+  sign-in back to the `claude` CLI through `/status` in a pseudo-terminal,
+  verifying the renewal by the keychain change, and the probe's launch options
+  and retry timing
+
+No code was copied from claude-usage-bar or claudecodeusage; this repository
+reimplements their approach in Rust. The sign-in renewal in
+`src/claude_renew.rs` is a Rust port of CodexBar's delegated refresh
+(Copyright (c) 2026 Peter Steinberger, MIT License). Their work made this
+feature possible.
 
 ## License
 
