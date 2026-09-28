@@ -218,6 +218,15 @@ Scripts/check.sh
 
 通常のpackaged runtimeを検証するときはmaterialize後の `dist/Mini System Monitor.app` にあるappまたはbundle executableを直接実行し、Cargoをruntime wrapperとして使いません。
 
+## 謝辞
+
+Claudeの残量表示は、次のオープンソースプロジェクトが見つけて公開してくれた方法にならっています。その知見を惜しみなく共有してくださった作者の方々に、敬意とともに深く感謝します。
+
+- [@hamin-apple](https://github.com/hamin-apple) さんの [claude-usage-bar](https://github.com/hamin-apple/claude-usage-bar)：Claude Codeがキーチェーンに保存したトークンで利用状況APIを呼ぶ方法と、トークンをメモリにだけ置いて更新しないという慎重な扱い方
+- [@cmenesese](https://github.com/cmenesese) さんの [claudecodeusage](https://github.com/cmenesese/claudecodeusage)：キーチェーンと利用状況APIを使う経路と、APIに負担をかけない取得間隔
+
+これらのプロジェクトからコードはコピーしていません。このrepoでは同じ方法をRustで実装し直しています。お二人の公開があったからこそ、この機能を作れました。
+
 ## ライセンス
 
 [MIT License](LICENSE) で公開します。

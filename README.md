@@ -303,6 +303,22 @@ When validating the normal packaged runtime, materialize it and execute the app
 or its bundle executable directly from `dist/Mini System Monitor.app`; do not
 use Cargo as the runtime wrapper.
 
+## Acknowledgements
+
+The Claude quota feature follows the approach that these open-source projects
+worked out and documented openly. Many thanks to their authors for sharing it:
+
+- [claude-usage-bar](https://github.com/hamin-apple/claude-usage-bar) by
+  [@hamin-apple](https://github.com/hamin-apple) — reading Claude Code's
+  keychain token and calling the usage endpoint, and the careful policy of
+  keeping the token in memory only and never refreshing it
+- [claudecodeusage](https://github.com/cmenesese/claudecodeusage) by
+  [@cmenesese](https://github.com/cmenesese) — the keychain and usage-endpoint
+  route, and a polling interval gentle on the endpoint
+
+No code was copied from these projects; this repository reimplements the
+approach in Rust. Their work made this feature possible.
+
 ## License
 
 Released under the [MIT License](LICENSE).
