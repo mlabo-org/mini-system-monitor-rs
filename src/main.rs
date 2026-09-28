@@ -1,3 +1,4 @@
+mod claude_quota;
 mod claude_usage;
 mod codex_usage;
 mod frontmost;
@@ -12,7 +13,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use claude_usage::{ClaudeUsageSampler, ClaudeUsageState};
+use claude_quota::{ClaudeQuotaError, ClaudeQuotaPoller, ClaudeQuotaState};
+use claude_usage::ClaudeUsageSampler;
 use codex_usage::{
     CodexActionKind, CodexActivity, CodexControl, CodexServiceTier, CodexUsageContent,
     CodexUsagePoller, CodexUsageState, CodexUsageStatus, QuotaBucket, QuotaWindow, ResetCredit,
@@ -284,8 +286,10 @@ struct MonitorApp {
     codex_rx: Receiver<CodexUsageState>,
     token_usage: Option<TokenUsageState>,
     token_rx: Receiver<TokenUsageState>,
-    claude_usage: Option<ClaudeUsageState>,
-    claude_rx: Receiver<ClaudeUsageState>,
+    claude_quota: ClaudeQuotaState,
+    claude_quota_rx: Receiver<ClaudeQuotaState>,
+    claude_tokens: Option<TokenUsageState>,
+    claude_tokens_rx: Receiver<TokenUsageState>,
     detected_assistant: Assistant,
     last_frontmost_check: Option<Instant>,
     codex_control_tx: Sender<CodexControl>,
@@ -369,8 +373,10 @@ impl MonitorApp {
             codex_rx,
             token_usage: None,
             token_rx: start_token_usage_sampler(),
-            claude_usage: None,
-            claude_rx: start_claude_usage_sampler(),
+            claude_quota: ClaudeQuotaState::loading(),
+            claude_quota_rx: start_claude_quota_poller(),
+            claude_tokens: None,
+            claude_tokens_rx: start_claude_usage_sampler(),
             detected_assistant: Assistant::Codex,
             last_frontmost_check: None,
             codex_control_tx,
@@ -400,8 +406,11 @@ impl MonitorApp {
         while let Ok(token_usage) = self.token_rx.try_recv() {
             self.token_usage = Some(token_usage);
         }
-        while let Ok(claude_usage) = self.claude_rx.try_recv() {
-            self.claude_usage = Some(claude_usage);
+        while let Ok(claude_quota) = self.claude_quota_rx.try_recv() {
+            self.claude_quota = claude_quota;
+        }
+        while let Ok(claude_tokens) = self.claude_tokens_rx.try_recv() {
+            self.claude_tokens = Some(claude_tokens);
         }
     }
 
@@ -671,7 +680,8 @@ impl eframe::App for MonitorApp {
                         Assistant::Claude => {
                             draw_claude_usage_card(
                                 ui,
-                                self.claude_usage.as_ref(),
+                                &self.claude_quota,
+                                self.claude_tokens.as_ref(),
                                 language,
                                 palette,
                             );
@@ -685,7 +695,7 @@ impl eframe::App for MonitorApp {
                         &self.snapshot,
                         assistant,
                         &self.codex_usage,
-                        self.claude_usage.as_ref(),
+                        &self.claude_quota,
                         self.codex_details_open,
                         language,
                         palette,
@@ -1235,7 +1245,7 @@ fn start_token_usage_sampler() -> Receiver<TokenUsageState> {
     rx
 }
 
-fn start_claude_usage_sampler() -> Receiver<ClaudeUsageState> {
+fn start_claude_usage_sampler() -> Receiver<TokenUsageState> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut sampler = ClaudeUsageSampler::from_env();
@@ -1244,6 +1254,20 @@ fn start_claude_usage_sampler() -> Receiver<ClaudeUsageState> {
                 break;
             }
             thread::sleep(Duration::from_secs(5));
+        }
+    });
+    rx
+}
+
+fn start_claude_quota_poller() -> Receiver<ClaudeQuotaState> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut poller = ClaudeQuotaPoller::default();
+        loop {
+            if tx.send(poller.refresh()).is_err() {
+                break;
+            }
+            thread::sleep(poller.next_delay());
         }
     });
     rx
@@ -1439,7 +1463,7 @@ fn draw_compact_card(
     snapshot: &Snapshot,
     assistant: Assistant,
     state: &CodexUsageState,
-    claude_usage: Option<&ClaudeUsageState>,
+    claude_quota: &ClaudeQuotaState,
     details_open: bool,
     language: Language,
     palette: Palette,
@@ -1500,29 +1524,41 @@ fn draw_compact_card(
         palette,
     );
     if assistant == Assistant::Claude {
-        let hour = claude_usage.and_then(|usage| usage.last_hour.totals);
-        let five_hours = claude_usage.and_then(|usage| usage.last_five_hours.totals);
+        let bucket = claude_quota.content.as_ref().map(|quota| &quota.bucket);
         draw_compact_metric(
             &painter,
             codex_rect,
             CompactMetricDisplay {
-                title: match language {
-                    Language::Japanese => "Claude 1時間",
-                    Language::English => "Claude 1h",
+                title: "Claude",
+                value: match (bucket, language) {
+                    (Some(bucket), Language::Japanese) => {
+                        format!("5h {}残", bucket.five_hour.remaining_text())
+                    }
+                    (Some(bucket), Language::English) => {
+                        format!("5h {} left", bucket.five_hour.remaining_text())
+                    }
+                    (None, _) => localized_status(claude_quota.status, language).to_owned(),
                 },
-                value: hour
-                    .map(|totals| abbreviated_tokens(totals.input.saturating_add(totals.output)))
-                    .unwrap_or_else(|| "--".to_owned()),
-                detail: format!(
-                    "5h {}",
-                    five_hours
-                        .map(|totals| abbreviated_tokens(
-                            totals.input.saturating_add(totals.output)
-                        ))
-                        .unwrap_or_else(|| "--".to_owned())
-                ),
-                percent: 0.0,
-                accent: palette.claude_accent,
+                detail: match (bucket, language) {
+                    (Some(bucket), Language::Japanese) => {
+                        format!("週{}", bucket.weekly.remaining_text())
+                    }
+                    (Some(bucket), Language::English) => {
+                        format!("W{}", bucket.weekly.remaining_text())
+                    }
+                    (None, Language::Japanese) => "使用量 --".to_owned(),
+                    (None, Language::English) => "Usage --".to_owned(),
+                },
+                percent: bucket
+                    .and_then(|bucket| {
+                        bucket
+                            .five_hour
+                            .remaining_percent
+                            .or(bucket.weekly.remaining_percent)
+                    })
+                    .map(f32::from)
+                    .unwrap_or(0.0),
+                accent: status_color(claude_quota.status, palette),
             },
             palette,
         );
@@ -1765,16 +1801,13 @@ fn abbreviated_tokens(tokens: u64) -> String {
 enum TokenSection {
     CodexHour,
     ClaudeHour,
-    ClaudeFiveHours,
 }
 
 impl TokenSection {
     fn title(self, language: Language) -> &'static str {
         match (self, language) {
-            (Self::CodexHour | Self::ClaudeHour, Language::Japanese) => "トークン · 直近1時間",
-            (Self::CodexHour | Self::ClaudeHour, Language::English) => "Tokens · last hour",
-            (Self::ClaudeFiveHours, Language::Japanese) => "トークン · 直近5時間",
-            (Self::ClaudeFiveHours, Language::English) => "Tokens · last 5 hours",
+            (_, Language::Japanese) => "トークン · 直近1時間",
+            (_, Language::English) => "Tokens · last hour",
         }
     }
 
@@ -1786,11 +1819,11 @@ impl TokenSection {
             (Self::CodexHour, Language::English) => {
                 "Last 60 minutes of Codex records stored on this Mac, refreshed every 5 seconds.\nTotal = input + output. Cached tokens are part of input; the percentage is cached input / all input, not a request-level hit rate. Reasoning is part of output.\nUses record timestamps; in-flight, other-device and cloud usage may be absent. This is not quota consumption.\nPartial means some records could not be counted completely."
             }
-            (Self::ClaudeHour | Self::ClaudeFiveHours, Language::Japanese) => {
-                "このMacに保存されたClaude Code記録（ターミナルとデスクトップアプリのCodeタブ）の集計です。5秒ごとに更新します。\n合計 = 入力 + 出力。入力にはキャッシュ読込と書込を含み、割合はキャッシュ読込 ÷ 全入力です。「書込」はキャッシュ作成分です。\nclaude.ai やアプリの通常チャット、他の端末の使用量は含まれません。残りの利用枠や消費率ではありません。\n「一部集計」は読めない記録などがあり、集計が不完全な状態です。"
+            (Self::ClaudeHour, Language::Japanese) => {
+                "このMacに保存されたClaude Code記録（ターミナルとデスクトップアプリのCodeタブ）の直近60分。5秒ごとに集計します。\n合計 = 入力 + 出力。入力にはキャッシュ読込と書込を含み、割合はキャッシュ読込 ÷ 全入力です。「書込」はキャッシュ作成分です。\nclaude.ai やアプリの通常チャット、他の端末の使用量は含まれません。残りの利用枠や消費率ではありません。\n「一部集計」は読めない記録などがあり、集計が不完全な状態です。"
             }
-            (Self::ClaudeHour | Self::ClaudeFiveHours, Language::English) => {
-                "Claude Code records stored on this Mac (terminal and the desktop app's Code tab), refreshed every 5 seconds.\nTotal = input + output. Input includes cache reads and writes; the percentage is cache reads / all input. \"Write\" is cache creation.\nclaude.ai and regular app chats and other devices are not included. This is not remaining quota or quota consumption.\nPartial means some records could not be counted completely."
+            (Self::ClaudeHour, Language::English) => {
+                "Last 60 minutes of Claude Code records stored on this Mac (terminal and the desktop app's Code tab), refreshed every 5 seconds.\nTotal = input + output. Input includes cache reads and writes; the percentage is cache reads / all input. \"Write\" is cache creation.\nclaude.ai and regular app chats and other devices are not included. This is not remaining quota or quota consumption.\nPartial means some records could not be counted completely."
             }
         }
     }
@@ -1896,7 +1929,8 @@ fn draw_token_usage_section(
 
 fn draw_claude_usage_card(
     ui: &mut egui::Ui,
-    usage: Option<&ClaudeUsageState>,
+    quota: &ClaudeQuotaState,
+    tokens: Option<&TokenUsageState>,
     language: Language,
     palette: Palette,
 ) {
@@ -1926,9 +1960,9 @@ fn draw_claude_usage_card(
     painter.text(
         Pos2::new(inner.right(), inner.top() + 1.0),
         Align2::RIGHT_TOP,
-        "Claude Code",
+        localized_status(quota.status, language),
         FontId::proportional(10.0),
-        palette.claude_accent,
+        status_color(quota.status, palette),
     );
 
     let footer_height = 26.0;
@@ -1941,21 +1975,30 @@ fn draw_claude_usage_card(
         Pos2::new(inner.right(), footer_rect.top() - 7.0),
     );
 
+    let bucket = quota
+        .content
+        .as_ref()
+        .map(|content| content.bucket_at(unix_now_seconds()));
     ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
         ui.set_clip_rect(content_rect);
         ui.set_width(content_rect.width());
         ui.columns(2, |columns| {
-            draw_token_usage_section(
+            draw_quota_section(
                 &mut columns[0],
-                usage.map(|usage| &usage.last_hour),
-                TokenSection::ClaudeHour,
+                bucket.as_ref(),
+                "Claude",
+                Some(match language {
+                    Language::Japanese => "未取得",
+                    Language::English => "Unavailable",
+                }),
                 language,
+                palette.claude_accent,
                 palette,
             );
             draw_token_usage_section(
                 &mut columns[1],
-                usage.map(|usage| &usage.last_five_hours),
-                TokenSection::ClaudeFiveHours,
+                tokens,
+                TokenSection::ClaudeHour,
                 language,
                 palette,
             );
@@ -1968,16 +2011,50 @@ fn draw_claude_usage_card(
         ui.set_clip_rect(footer_rect);
         ui.set_width(footer_rect.width());
         ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 7.0;
             ui.label(
-                RichText::new(match language {
-                    Language::Japanese => "残りの利用枠は取得できません（使用量のみ表示）",
-                    Language::English => "Remaining quota is unavailable (usage only)",
-                })
+                RichText::new(last_updated_text(
+                    quota.content.as_ref().map(|content| content.fetched_at),
+                    language,
+                ))
                 .size(10.5)
                 .color(palette.text_muted),
-            );
+            )
+            .on_hover_text(match language {
+                Language::Japanese => {
+                    "Claude Codeがキーチェーンに保存したログイン情報で、非公開の利用状況APIから5時間枠と週枠を3分ごとに取得します。\nこのアプリはログイン情報を更新・保存しません。期限切れのときは claude を起動すると更新されます。"
+                }
+                Language::English => {
+                    "Fetched every 3 minutes from an undocumented usage API with the sign-in Claude Code keeps in the keychain.\nThis app never refreshes or stores the sign-in; when it has expired, starting claude renews it."
+                }
+            });
+            if let Some(error) = &quota.error {
+                ui.label(
+                    RichText::new(claude_quota_error_text(error, language))
+                        .size(10.5)
+                        .color(status_color(quota.status, palette)),
+                );
+            }
         });
     });
+}
+
+fn claude_quota_error_text(error: &ClaudeQuotaError, language: Language) -> String {
+    match (error, language) {
+        (ClaudeQuotaError::SignedOut, Language::Japanese) => "Claude Code未ログイン".to_owned(),
+        (ClaudeQuotaError::SignedOut, Language::English) => "Claude Code signed out".to_owned(),
+        (ClaudeQuotaError::TokenExpired, Language::Japanese) => {
+            "ログイン期限切れ · claudeを起動".to_owned()
+        }
+        (ClaudeQuotaError::TokenExpired, Language::English) => {
+            "Sign-in expired · start claude".to_owned()
+        }
+        (ClaudeQuotaError::Rejected, Language::Japanese) => "認証を拒否されました".to_owned(),
+        (ClaudeQuotaError::Rejected, Language::English) => "Sign-in rejected".to_owned(),
+        (ClaudeQuotaError::RateLimited, Language::Japanese) => "取得制限中 · 後で再試行".to_owned(),
+        (ClaudeQuotaError::RateLimited, Language::English) => "Rate limited · retrying".to_owned(),
+        (ClaudeQuotaError::Failed(detail), _) => compact_text(detail, 28),
+    }
 }
 
 fn draw_assistant_switch(
@@ -2170,9 +2247,12 @@ fn draw_codex_management(
                     .color(palette.text_main),
                 );
                 ui.label(
-                    RichText::new(last_updated_text(state, language))
-                        .size(11.0)
-                        .color(palette.text_muted),
+                    RichText::new(last_updated_text(
+                        state.content.as_ref().map(|content| content.fetched_at),
+                        language,
+                    ))
+                    .size(11.0)
+                    .color(palette.text_muted),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2847,8 +2927,8 @@ fn localized_service_tier(service_tier: CodexServiceTier, language: Language) ->
     }
 }
 
-fn last_updated_text(state: &CodexUsageState, language: Language) -> String {
-    let Some(fetched_at) = state.content.as_ref().map(|content| content.fetched_at) else {
+fn last_updated_text(fetched_at: Option<i64>, language: Language) -> String {
+    let Some(fetched_at) = fetched_at else {
         return match language {
             Language::Japanese => "最終更新 --",
             Language::English => "Last updated --",

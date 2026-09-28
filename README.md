@@ -13,7 +13,8 @@ front, or can be pinned to either one.
 This is an independent, unofficial utility and is not affiliated with or
 endorsed by OpenAI or Anthropic. Its Codex integration depends on the local
 `codex app-server` interface, and its Claude integration reads local Claude Code
-transcript files; either may need updates when those tools change.
+transcript files and an undocumented Anthropic usage endpoint; either may need
+updates when those tools change.
 
 ## Features
 
@@ -46,10 +47,10 @@ terminal, the terminal is in front, so pin the view you want instead.
 
 ### Claude Code usage
 
-- Rolling last-hour and last-5-hour token totals
-- Input/output, cache reads with their share of input, and cache writes
-- Counts both terminal `claude` and the Claude desktop app's Code tab
-- Remaining Claude quota is not shown, because no local interface provides it
+- Claude 5-hour and weekly remaining quota, laid out like the Codex view
+- Last-hour local token total, input/output, cache reads with their share of
+  input, and cache writes
+- Token totals count both terminal `claude` and the Claude desktop app's Code tab
 
 ### Codex usage and controls
 
@@ -147,6 +148,24 @@ The nearest-expiring eligible credit is selected. An idempotency journal at
 `~/Library/Application Support/mini-system-monitor-rs/codex-auto-reset.json`
 prevents duplicate consumption across retries or restarts.
 
+## Claude quota
+
+The remaining quota comes from `https://api.anthropic.com/api/oauth/usage`, the
+same undocumented endpoint other open-source Claude usage monitors use. It is not
+part of Anthropic's public API, may change or stop working at any time, and it is
+unconfirmed whether Anthropic's terms allow third-party tools to call it. Use it
+at your own risk.
+
+- The access token is the one Claude Code stores in the login keychain
+  (`Claude Code-credentials`), read with `/usr/bin/security` right before each
+  request.
+- The token is passed to `/usr/bin/curl` on stdin, so it never appears in process
+  arguments. It is kept only in memory and never logged, written, or refreshed.
+- An expired token is not used. Starting `claude` lets Claude Code renew it.
+- The quota is fetched every 3 minutes, backing off up to 15 minutes after
+  failures while keeping the last good result. Reset countdowns update locally.
+- Only the 5-hour (`five_hour`) and weekly (`seven_day`) windows are shown.
+
 ## Claude Code usage records
 
 The Claude view reads Claude Code transcripts under `CLAUDE_CONFIG_DIR` (default:
@@ -160,8 +179,8 @@ pass.
   displayed input is their sum, and total is input plus output.
 - The cache percentage is cache-read tokens divided by all input tokens. `Write`
   is cache-creation input.
-- The windows are rolling (last 60 minutes and last 5 hours by record time).
-  They are not Claude's quota windows and do not show remaining quota.
+- The window is the rolling last 60 minutes by record time. It is not a Claude
+  quota window; remaining quota comes from the endpoint above.
 - claude.ai, regular chats in the Claude app, and other devices leave no local
   Claude Code transcript and are not counted.
 - Unreadable or malformed records are marked “partial”; a missing directory
@@ -185,7 +204,8 @@ temperature. If no valid source is available, the UI shows `温度 --` / `Temp -
 - Xcode Command Line Tools for native linking, bundle validation, and signing
 - A working Codex CLI, Codex app, or ChatGPT app for Codex usage features
 - An authenticated Codex session for account data
-- Claude Code (terminal or the Claude desktop app's Code tab) for Claude usage
+- Claude Code (terminal or the Claude desktop app's Code tab) for Claude usage,
+  signed in with a Claude subscription for the remaining quota
 
 The system monitor continues to work when Codex or Claude data is unavailable.
 
