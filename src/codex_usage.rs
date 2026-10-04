@@ -17,7 +17,8 @@ use uuid::Uuid;
 
 const CODEX_COMMAND: &str = "codex";
 const APP_SERVER_ARG: &str = "app-server";
-const CHATGPT_APP_BUNDLED_CLI: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
+const CHATGPT_APP_BUNDLED_CLI: &str =
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex";
 const CODEX_APP_BUNDLED_CLI: &str = "/Applications/Codex.app/Contents/Resources/codex";
 const CODEX_VIABILITY_TIMEOUT: Duration = Duration::from_secs(2);
 const CODEX_VIABILITY_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -1402,7 +1403,7 @@ mod tests {
         let first_bin = root.join("first-bin");
         let home = root.join("home");
         let home_bin = home.join(".local/bin");
-        let fixed = root.join("ChatGPT.app/Contents/Resources/codex");
+        let fixed = root.join("ChatGPT.app/Contents/Resources/codex-cli/bin/codex");
         let path_env = env::join_paths([first_bin.as_path(), home_bin.as_path()])
             .expect("join candidate paths");
         let home_candidate = home_bin.join(CODEX_COMMAND);
