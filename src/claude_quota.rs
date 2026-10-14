@@ -80,7 +80,8 @@ impl ClaudeQuota {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClaudeQuotaError {
-    /// No Claude Code credentials in the keychain.
+    /// No Claude Code sign-in in the keychain: the item is missing, or Claude
+    /// Code emptied its tokens when it signed out.
     SignedOut,
     /// The stored access token has expired; Claude Code refreshes it on use.
     TokenExpired,
@@ -187,6 +188,9 @@ struct Keychain {
 struct OAuth {
     #[serde(rename = "accessToken")]
     access_token: Option<String>,
+    /// Only its presence is read: without it Claude Code cannot renew.
+    #[serde(rename = "refreshToken")]
+    refresh_token: Option<String>,
     /// Unix milliseconds.
     #[serde(rename = "expiresAt")]
     expires_at: Option<i64>,
@@ -226,9 +230,19 @@ fn read_keychain_item() -> Option<Vec<u8>> {
 
 fn read_access_token(now_secs: i64) -> Result<String, ClaudeQuotaError> {
     let item = read_keychain_item().ok_or(ClaudeQuotaError::SignedOut)?;
+    access_token_from_item(&item, now_secs)
+}
+
+fn access_token_from_item(item: &[u8], now_secs: i64) -> Result<String, ClaudeQuotaError> {
     let keychain: Keychain =
-        serde_json::from_slice(&item).map_err(|_| ClaudeQuotaError::SignedOut)?;
+        serde_json::from_slice(item).map_err(|_| ClaudeQuotaError::SignedOut)?;
     let oauth = keychain.oauth.ok_or(ClaudeQuotaError::SignedOut)?;
+    // Signing out keeps the item but empties both tokens and zeroes the
+    // expiry, which would otherwise read as an expired token to renew.
+    let present = |token: &Option<String>| token.as_deref().is_some_and(|token| !token.is_empty());
+    if !present(&oauth.access_token) && !present(&oauth.refresh_token) {
+        return Err(ClaudeQuotaError::SignedOut);
+    }
     if oauth.expires_at.is_some_and(|expires_at| {
         expires_at
             <= now_secs
@@ -353,6 +367,29 @@ mod tests {
         assert_eq!(quota.bucket.five_hour.remaining_percent, None);
         assert_eq!(quota.bucket.weekly.remaining_percent, None);
         assert_eq!(quota.bucket.weekly.reset_text, "--");
+    }
+
+    #[test]
+    fn signed_out_item_is_not_an_expired_token() {
+        let now = timestamp_secs("2026-10-14T05:50:00Z").unwrap();
+        let item = |access: &str, refresh: &str, expires_at: i64| {
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"{refresh}","expiresAt":{expires_at}}}}}"#
+            )
+        };
+        assert_eq!(
+            access_token_from_item(item("", "", 0).as_bytes(), now),
+            Err(ClaudeQuotaError::SignedOut)
+        );
+        assert_eq!(
+            access_token_from_item(item("a", "r", 0).as_bytes(), now),
+            Err(ClaudeQuotaError::TokenExpired)
+        );
+        let later = (now + 3600) * 1000;
+        assert_eq!(
+            access_token_from_item(item("a", "r", later).as_bytes(), now),
+            Ok("a".to_owned())
+        );
     }
 
     #[test]
