@@ -69,6 +69,36 @@ language. A Mac set to Japan therefore shows `JST`; zones with daylight saving
 time use the abbreviation and offset that apply to the expiry date. UTC is used
 only if local conversion is unavailable.
 
+## Use it alone or with cache-band
+
+The monitor is a complete app on its own. It also serves one optional
+companion, [cache-band](https://github.com/mlabo-org/cache-band), a Claude Code
+mod that shows the prompt-cache read rate above Claude Code's prompt.
+
+| You want | Install | What runs |
+| --- | --- | --- |
+| The monitor window only | This app ([Install](#install-with-codex-or-the-terminal)) | The window. Nothing else; the JSON mode below stays unused. |
+| The window and the band in Claude Code | This app first, then cache-band ([its install steps](https://github.com/mlabo-org/cache-band#install)) | The window when you open it, plus a short `--claude-cache-json` run of this app's executable, started by the mod at the end of each Claude Code turn and every 30 seconds |
+| The band only | Both, as in the row above | The same short runs; the window can stay closed |
+
+For band users:
+
+- cache-band runs this app's executable itself, so the window does not need to
+  be open. Each run prints one line of JSON and exits in well under a second;
+  it does not open a window and does not touch the running app.
+- The band's `session` and `all 60m` figures come from the same code as the
+  Claude view's last-hour figures, so the band and the window agree.
+- cache-band looks for the executable at
+  `/Applications/Mini System Monitor.app/Contents/MacOS/mini-system-monitor-rs`.
+  If you install the app elsewhere, set cache-band's `monitorPath` option to
+  the executable inside your app.
+- The flag exists from commit `1f92771` (2026-10-17). With an older build the
+  band says `Mini System Monitor too old`; update the app with
+  `Scripts/install-app.sh … --replace`. The mod never runs an older build,
+  because it would open its window instead.
+- The JSON format is described in
+  [Reading the numbers from other tools](#reading-the-numbers-from-other-tools).
+
 ## UI preview
 
 Quota, RESET, and token values depend on the signed-in account and local usage;
@@ -206,7 +236,8 @@ text.
 
 The same totals can be printed as one line of JSON without opening the window,
 for other local tools such as [cache-band](https://github.com/mlabo-org/cache-band),
-a Claude Code mod that shows the cache rate above the prompt.
+a Claude Code mod that shows the cache rate above the prompt (see
+[Use it alone or with cache-band](#use-it-alone-or-with-cache-band)).
 
 ```bash
 "/Applications/Mini System Monitor.app/Contents/MacOS/mini-system-monitor-rs" --claude-cache-json --session <session-id>

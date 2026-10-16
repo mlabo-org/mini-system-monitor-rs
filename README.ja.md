@@ -51,6 +51,24 @@
 
 RESETの期限はCodexから絶対時刻として取得します。表示言語とは独立してmacOSのシステムタイムゾーン規則で変換するため、日本に設定されたMacでは `JST`、夏時間のある地域では期限日時に適用される略称とオフセットを表示します。ローカル変換が利用できない場合のみUTCへフォールバックします。
 
+## 単体で使う・cache-band と併用する
+
+モニターはこれだけで完結したアプリです。加えて、任意の相棒として [cache-band](https://github.com/mlabo-org/cache-band) に数字を渡せます。cache-band は、Claude Code の入力欄の上にプロンプトキャッシュの読み込み率を出す mod です。
+
+| やりたいこと | 入れるもの | 動くもの |
+| --- | --- | --- |
+| モニターの画面だけ使う | このアプリ（[インストール](#codexまたはターミナルからインストール)） | 画面だけ。下の JSON 出力は使われません |
+| 画面と Claude Code の帯の両方 | 先にこのアプリ、次に cache-band（[cache-band の導入手順](https://github.com/mlabo-org/cache-band/blob/main/README.ja.md#導入)） | 開いたときの画面に加えて、mod が Claude Code のターンの終わりごとと30秒ごとに、このアプリの実行ファイルを `--claude-cache-json` で短時間だけ動かします |
+| 帯だけ使う | 上と同じく両方 | 同じ短い実行だけ。画面は閉じたままで構いません |
+
+帯を使う場合の注意：
+
+- cache-band はこのアプリの実行ファイルを自分で動かすので、画面を開いておく必要はありません。1回の実行は JSON を1行出して1秒かからずに終わります。ウィンドウは開かず、動いているアプリにも触りません
+- 帯の「セッション」と「全体60分」は、Claude表示の直近1時間の数字と同じコードで計算しています。帯と画面の数字は一致します
+- cache-band は `/Applications/Mini System Monitor.app/Contents/MacOS/mini-system-monitor-rs` を探します。アプリを別の場所に入れたときは、cache-band の `monitorPath` 設定にアプリの中の実行ファイルを指定してください
+- この機能はコミット `1f92771`（2026-10-17）からです。それより古い版だと帯に「Mini System Monitor が古い」と出るので、`Scripts/install-app.sh … --replace` で更新してください。古い版は引数を無視して画面を開いてしまうため、mod は古い版を実行しません
+- JSON の形は[他のツールから数字を読む](#他のツールから数字を読む)にあります
+
 ## UIプレビュー
 
 利用枠、RESET、トークンの値はサインイン中のアカウントと手元の使用状況によって異なります。次の画像は表示例です。
@@ -137,7 +155,7 @@ Claude表示は、`CLAUDE_CONFIG_DIR`（未指定時は `~/.claude`）の `proje
 
 ### 他のツールから数字を読む
 
-同じ集計を、画面を開かずにJSONで1行出せます。Claude Codeの入力欄の上にキャッシュ率を出すmod [cache-band](https://github.com/mlabo-org/cache-band) など、ローカルの他のツールが使う入口です。
+同じ集計を、画面を開かずにJSONで1行出せます。Claude Codeの入力欄の上にキャッシュ率を出すmod [cache-band](https://github.com/mlabo-org/cache-band) など、ローカルの他のツールが使う入口です（[単体で使う・cache-band と併用する](#単体で使うcache-band-と併用する)）。
 
 ```bash
 "/Applications/Mini System Monitor.app/Contents/MacOS/mini-system-monitor-rs" --claude-cache-json --session <セッションID>
