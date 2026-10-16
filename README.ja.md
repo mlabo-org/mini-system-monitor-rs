@@ -135,6 +135,18 @@ Claude表示は、`CLAUDE_CONFIG_DIR`（未指定時は `~/.claude`）の `proje
 
 モニターは会話記録を変更せず、会話本文を保存・送信しません。
 
+### 他のツールから数字を読む
+
+同じ集計を、画面を開かずにJSONで1行出せます。Claude Codeの入力欄の上にキャッシュ率を出すmodなど、ローカルの他のツールが使う入口です。
+
+```bash
+"/Applications/Mini System Monitor.app/Contents/MacOS/mini-system-monitor-rs" --claude-cache-json --session <セッションID>
+```
+
+- `window` は上のClaude表示と同じ直近60分の集計です（`input` はキャッシュ読込・書込を含む入力の合計、`cache_read` と `cache_write` はその内訳）。
+- `--session` を付けると、そのセッションの記録とその下のサブエージェントの記録を時間の区切りなしで合計した `session` も出します。該当する記録がなければ `found` が `false` です。
+- 引数が正しくない場合は使い方を標準エラーに出し、終了コード2で終わります。
+
 ## 温度取得
 
 macOSでは、最初にprivate IOHIDセンサー経路を試し、次に `sysinfo` のコンポーネント、最後に利用可能な `osx-cpu-temp`、`istats`、`powermetrics` を時間制限付きで試します。これはApple SiliconのSoC/PMU系温度をベストエフォートで取得するもので、個別CPUコアの厳密な温度ではありません。有効な値を取得できない場合は `温度 --` / `Temp --` と表示します。

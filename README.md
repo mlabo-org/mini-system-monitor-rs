@@ -202,6 +202,24 @@ pass.
 The monitor does not modify the transcripts or retain or transmit conversation
 text.
 
+### Reading the numbers from other tools
+
+The same totals can be printed as one line of JSON without opening the window,
+for other local tools such as a Claude Code mod that shows the cache rate above
+the prompt.
+
+```bash
+"/Applications/Mini System Monitor.app/Contents/MacOS/mini-system-monitor-rs" --claude-cache-json --session <session-id>
+```
+
+- `window` is the same last-60-minutes total as the Claude view (`input` is all
+  input including cache reads and writes; `cache_read` and `cache_write` are
+  parts of it).
+- With `--session`, `session` adds that session's transcript and its subagent
+  transcripts, with no time window. `found` is `false` when no transcript has
+  that ID.
+- Invalid arguments print the usage to standard error and exit with code 2.
+
 ## Temperature behavior
 
 On macOS, temperature collection first tries the private IOHID sensor route,

@@ -262,6 +262,13 @@ impl Palette {
 }
 
 fn main() -> eframe::Result<()> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--claude-cache-json") {
+        std::process::exit(claude_usage::print_cache_json(
+            &args[1..],
+            unix_now_seconds(),
+        ));
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(FULL_WINDOW_SIZE)

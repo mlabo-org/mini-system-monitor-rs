@@ -158,6 +158,134 @@ impl ClaudeUsageSampler {
             cache_write: available.then_some(cache_write),
         }
     }
+
+    /// Totals of one session's whole transcript and its subagent transcripts,
+    /// with no time window. `found` is false when no transcript has that ID.
+    pub fn session(&self, session_id: &str) -> SessionUsage {
+        let mut result = SessionUsage::default();
+        let Some(home) = &self.home else {
+            result.partial = true;
+            return result;
+        };
+        let Ok(projects) = fs::read_dir(home.join("projects")) else {
+            result.partial = true;
+            return result;
+        };
+        let mut files = Vec::new();
+        for project in projects {
+            let Ok(project) = project else {
+                result.partial = true;
+                continue;
+            };
+            let main = project.path().join(format!("{session_id}.jsonl"));
+            if let Ok(metadata) = fs::metadata(&main) {
+                files.push((main, metadata));
+            }
+            if let Ok(children) = fs::read_dir(project.path().join(session_id)) {
+                collect_files(children, &mut files, &mut result.partial);
+            }
+        }
+        result.found = !files.is_empty();
+        let mut usages: HashMap<String, Usage> = HashMap::new();
+        for (path, _) in files {
+            let Ok(file) = File::open(&path) else {
+                result.partial = true;
+                continue;
+            };
+            let mut reader = BufReader::new(file);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => {
+                        result.partial = true;
+                        break;
+                    }
+                }
+                match parse_line(&line) {
+                    Line::Skip => {}
+                    Line::Malformed => result.partial |= line.last() == Some(&b'\n'),
+                    Line::Usage { id, usage, .. } => {
+                        usages
+                            .entry(id)
+                            .and_modify(|known| known.merge(usage))
+                            .or_insert(usage);
+                    }
+                }
+            }
+        }
+        let mut totals = TokenTotals::default();
+        for usage in usages.values() {
+            let input = usage
+                .input_tokens
+                .checked_add(usage.cache_read_input_tokens)
+                .and_then(|sum| sum.checked_add(usage.cache_creation_input_tokens));
+            result.partial |= input.is_none();
+            result.partial |= !totals.add(TokenTotals {
+                input: input.unwrap_or(u64::MAX),
+                cached_input: usage.cache_read_input_tokens,
+                output: usage.output_tokens,
+            });
+            result.cache_write = result
+                .cache_write
+                .saturating_add(usage.cache_creation_input_tokens);
+        }
+        result.totals = totals;
+        result
+    }
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct SessionUsage {
+    pub totals: TokenTotals,
+    pub cache_write: u64,
+    pub partial: bool,
+    pub found: bool,
+}
+
+/// `--claude-cache-json [--session ID]`: prints the last-hour totals the
+/// Claude view shows, and one session's totals when an ID is given, as one
+/// JSON object for other local tools. Returns the process exit code.
+pub fn print_cache_json(args: &[String], now_secs: i64) -> i32 {
+    let session_id = match args {
+        [] => None,
+        [flag, id] if flag == "--session" && is_session_id(id) => Some(id.as_str()),
+        _ => {
+            eprintln!("usage: mini-system-monitor-rs --claude-cache-json [--session UUID]");
+            return 2;
+        }
+    };
+    let mut sampler = ClaudeUsageSampler::from_env();
+    let window = sampler.sample(now_secs);
+    let mut output = serde_json::json!({
+        "window_minutes": WINDOW / 60,
+        "window": window.totals.map(|totals| serde_json::json!({
+            "input": totals.input,
+            "cache_read": totals.cached_input,
+            "cache_write": window.cache_write.unwrap_or(0),
+            "output": totals.output,
+            "partial": window.partial,
+        })),
+    });
+    if let Some(id) = session_id {
+        let session = sampler.session(id);
+        output["session"] = serde_json::json!({
+            "found": session.found,
+            "input": session.totals.input,
+            "cache_read": session.totals.cached_input,
+            "cache_write": session.cache_write,
+            "output": session.totals.output,
+            "partial": session.partial,
+        });
+    }
+    println!("{output}");
+    0
+}
+
+fn is_session_id(text: &str) -> bool {
+    !text.is_empty() && text.len() <= 64 && text.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
 }
 
 fn collect_files(entries: fs::ReadDir, files: &mut Vec<(PathBuf, Metadata)>, partial: &mut bool) {
@@ -207,29 +335,15 @@ fn read_changes(
             break;
         }
         cursor.offset += count as u64;
-        // Rows without usage (user turns, summaries, tool results) are skipped
-        // cheaply; only a malformed line makes the total partial.
-        if !contains(&line, b"\"usage\"") {
-            continue;
-        }
-        let row: Row = match serde_json::from_slice(&line) {
-            Ok(row) => row,
-            Err(_) => {
+        let (id, at, usage) = match parse_line(&line) {
+            Line::Skip => continue,
+            Line::Malformed => {
                 cursor.partial_until = now.saturating_add(WINDOW);
                 continue;
             }
+            Line::Usage { id, at, usage } => (id, at, usage),
         };
-        let Some(Message {
-            id: Some(id),
-            usage: Some(usage),
-        }) = row.message
-        else {
-            continue;
-        };
-        if usage == Usage::default() {
-            continue;
-        }
-        let Some(at) = row.timestamp.as_deref().and_then(timestamp_secs) else {
+        let Some(at) = at else {
             cursor.partial_until = now.saturating_add(WINDOW);
             continue;
         };
@@ -247,6 +361,42 @@ fn read_changes(
     cursor.length = metadata.len();
     cursor.modified = (metadata.mtime(), metadata.mtime_nsec());
     Ok(())
+}
+
+enum Line {
+    Skip,
+    Malformed,
+    Usage {
+        id: String,
+        at: Option<i64>,
+        usage: Usage,
+    },
+}
+
+fn parse_line(line: &[u8]) -> Line {
+    // Rows without usage (user turns, summaries, tool results) are skipped
+    // cheaply; only a malformed line makes the total partial.
+    if !contains(line, b"\"usage\"") {
+        return Line::Skip;
+    }
+    let Ok(row) = serde_json::from_slice::<Row>(line) else {
+        return Line::Malformed;
+    };
+    let Some(Message {
+        id: Some(id),
+        usage: Some(usage),
+    }) = row.message
+    else {
+        return Line::Skip;
+    };
+    if usage == Usage::default() {
+        return Line::Skip;
+    }
+    Line::Usage {
+        id,
+        at: row.timestamp.as_deref().and_then(timestamp_secs),
+        usage,
+    }
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -371,5 +521,42 @@ mod tests {
         let state = fixture.sampler().sample(now());
         assert!(state.partial);
         assert_eq!(state.totals, Some(TokenTotals::default()));
+    }
+
+    #[test]
+    fn session_counts_its_own_and_subagent_transcripts_without_a_window() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.0.join("projects/-repo/abc/subagents")).unwrap();
+        fixture.append(
+            "abc.jsonl",
+            &[
+                assistant("m1", "2020-09-19T11:50:01Z", [2, 100, 50, 10]),
+                assistant("m1", "2020-09-19T11:50:02Z", [2, 100, 50, 10]),
+                assistant("m2", "2020-09-01T09:00:00Z", [1, 1000, 0, 5]),
+            ],
+        );
+        fixture.append(
+            "abc/subagents/agent-x.jsonl",
+            &[assistant("s1", "2020-09-19T11:55:00Z", [3, 0, 7, 4])],
+        );
+        fixture.append(
+            "def.jsonl",
+            &[assistant("o1", "2020-09-19T11:55:00Z", [9, 9, 9, 9])],
+        );
+        let sampler = fixture.sampler();
+        assert_eq!(
+            sampler.session("abc"),
+            SessionUsage {
+                totals: TokenTotals {
+                    input: 2 + 100 + 50 + 1 + 1000 + 3 + 7,
+                    cached_input: 1100,
+                    output: 19,
+                },
+                cache_write: 57,
+                partial: false,
+                found: true,
+            }
+        );
+        assert!(!sampler.session("absent").found);
     }
 }
