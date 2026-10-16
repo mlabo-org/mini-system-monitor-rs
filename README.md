@@ -205,8 +205,8 @@ text.
 ### Reading the numbers from other tools
 
 The same totals can be printed as one line of JSON without opening the window,
-for other local tools such as a Claude Code mod that shows the cache rate above
-the prompt.
+for other local tools such as [cache-band](https://github.com/mlabo-org/cache-band),
+a Claude Code mod that shows the cache rate above the prompt.
 
 ```bash
 "/Applications/Mini System Monitor.app/Contents/MacOS/mini-system-monitor-rs" --claude-cache-json --session <session-id>

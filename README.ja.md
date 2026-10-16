@@ -137,7 +137,7 @@ Claude表示は、`CLAUDE_CONFIG_DIR`（未指定時は `~/.claude`）の `proje
 
 ### 他のツールから数字を読む
 
-同じ集計を、画面を開かずにJSONで1行出せます。Claude Codeの入力欄の上にキャッシュ率を出すmodなど、ローカルの他のツールが使う入口です。
+同じ集計を、画面を開かずにJSONで1行出せます。Claude Codeの入力欄の上にキャッシュ率を出すmod [cache-band](https://github.com/mlabo-org/cache-band) など、ローカルの他のツールが使う入口です。
 
 ```bash
 "/Applications/Mini System Monitor.app/Contents/MacOS/mini-system-monitor-rs" --claude-cache-json --session <セッションID>
