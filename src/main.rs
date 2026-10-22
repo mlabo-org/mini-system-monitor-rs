@@ -1055,7 +1055,7 @@ fn draw_preferences(
                 )
                 .min_size(Vec2::new(60.0, 22.0))
                 .fill(button_color)
-                .stroke(Stroke::new(1.0, button_color))
+                .stroke(Stroke::new(1.0_f32, button_color))
                 .sense(if has_pending_change {
                     Sense::click()
                 } else {
@@ -1379,7 +1379,7 @@ fn draw_system_card(ui: &mut egui::Ui, snapshot: &Snapshot, language: Language, 
     painter.rect_stroke(
         rect,
         12.0,
-        Stroke::new(1.0, palette.card_stroke),
+        Stroke::new(1.0_f32, palette.card_stroke),
         StrokeKind::Inside,
     );
 
@@ -1423,7 +1423,7 @@ fn draw_system_card(ui: &mut egui::Ui, snapshot: &Snapshot, language: Language, 
             Pos2::new(divider_x, column_top + 3.0),
             Pos2::new(divider_x, inner.bottom() - 1.0),
         ],
-        Stroke::new(1.0, palette.panel_stroke),
+        Stroke::new(1.0_f32, palette.panel_stroke),
     );
 
     draw_system_metric(
@@ -1484,7 +1484,7 @@ fn draw_compact_card(
     painter.rect_stroke(
         rect,
         12.0,
-        Stroke::new(1.0, palette.card_stroke),
+        Stroke::new(1.0_f32, palette.card_stroke),
         StrokeKind::Inside,
     );
 
@@ -1722,7 +1722,7 @@ fn draw_codex_usage_card(
     painter.rect_stroke(
         rect,
         12.0,
-        Stroke::new(1.0, palette.card_stroke),
+        Stroke::new(1.0_f32, palette.card_stroke),
         StrokeKind::Inside,
     );
 
@@ -1956,7 +1956,7 @@ fn draw_claude_usage_card(
     painter.rect_stroke(
         rect,
         12.0,
-        Stroke::new(1.0, palette.card_stroke),
+        Stroke::new(1.0_f32, palette.card_stroke),
         StrokeKind::Inside,
     );
 
@@ -2576,7 +2576,7 @@ fn draw_reset_credit_row(
 ) {
     egui::Frame::new()
         .fill(palette.card_bg)
-        .stroke(Stroke::new(1.0, palette.card_stroke))
+        .stroke(Stroke::new(1.0_f32, palette.card_stroke))
         .corner_radius(8)
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
