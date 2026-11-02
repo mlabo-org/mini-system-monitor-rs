@@ -92,7 +92,7 @@ For band users:
   `/Applications/Mini System Monitor.app/Contents/MacOS/mini-system-monitor-rs`.
   If you install the app elsewhere, set cache-band's `monitorPath` option to
   the executable inside your app.
-- The flag exists from commit `1f92771` (2026-10-17). With an older build the
+- The flag exists from commit `30cde93` (2026-10-17). With an older build the
   band says `Mini System Monitor too old`; update the app with
   `Scripts/install-app.sh … --replace`. The mod never runs an older build,
   because it would open its window instead.
@@ -277,7 +277,7 @@ Fetch the locked Rust dependencies once after cloning:
 cargo fetch --locked
 ```
 
-## Run the prebuilt native app
+## Build and run the native app
 
 ```bash
 Scripts/materialize-app.sh
@@ -387,7 +387,8 @@ worked out and documented openly. Many thanks to their authors for sharing it:
 No code was copied from claude-usage-bar or claudecodeusage; this repository
 reimplements their approach in Rust. The sign-in renewal in
 `src/claude_renew.rs` is a Rust port of CodexBar's delegated refresh
-(Copyright (c) 2026 Peter Steinberger, MIT License). Their work made this
+(Copyright (c) 2026 Peter Steinberger, MIT License); its license text is in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Their work made this
 feature possible.
 
 ## License
