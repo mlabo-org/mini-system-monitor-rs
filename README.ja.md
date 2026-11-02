@@ -66,7 +66,7 @@ RESETの期限はCodexから絶対時刻として取得します。表示言語�
 - cache-band はこのアプリの実行ファイルを自分で動かすので、画面を開いておく必要はありません。1回の実行は JSON を1行出して1秒かからずに終わります。ウィンドウは開かず、動いているアプリにも触りません
 - 帯の「セッション」と「全体60分」は、Claude表示の直近1時間の数字と同じコードで計算しています。帯と画面の数字は一致します
 - cache-band は `/Applications/Mini System Monitor.app/Contents/MacOS/mini-system-monitor-rs` を探します。アプリを別の場所に入れたときは、cache-band の `monitorPath` 設定にアプリの中の実行ファイルを指定してください
-- この機能はコミット `1f92771`（2026-10-17）からです。それより古い版だと帯に「Mini System Monitor が古い」と出るので、`Scripts/install-app.sh … --replace` で更新してください。古い版は引数を無視して画面を開いてしまうため、mod は古い版を実行しません
+- この機能はコミット `30cde93`（2026-10-17）からです。それより古い版だと帯に「Mini System Monitor が古い」と出るので、`Scripts/install-app.sh … --replace` で更新してください。古い版は引数を無視して画面を開いてしまうため、mod は古い版を実行しません
 - JSON の形は[他のツールから数字を読む](#他のツールから数字を読む)にあります
 
 ## UIプレビュー
@@ -186,7 +186,7 @@ clone直後に、固定済みRust依存関係を一度取得します。
 cargo fetch --locked
 ```
 
-## ビルド済みネイティブアプリを実行
+## ネイティブアプリをビルドして実行
 
 ```bash
 Scripts/materialize-app.sh
@@ -258,7 +258,7 @@ Claudeの残量表示は、次のオープンソースプロジェクトが見�
 
 - [@steipete](https://github.com/steipete) さんの [CodexBar](https://github.com/steipete/CodexBar)：期限切れになったClaude Codeのログインを、仮想ターミナル内の `claude` の `/status` を通してClaude Code自身に更新させる方法と、キーチェーンの書き換わりで成功を確かめるやり方、起動オプションと再試行の間隔
 
-claude-usage-barとclaudecodeusageからコードはコピーしていません。このrepoでは同じ方法をRustで実装し直しています。`src/claude_renew.rs` のログイン更新は、CodexBarの委任リフレッシュをRustに移植したものです（Copyright (c) 2026 Peter Steinberger、MIT License）。皆さんの公開があったからこそ、この機能を作れました。
+claude-usage-barとclaudecodeusageからコードはコピーしていません。このrepoでは同じ方法をRustで実装し直しています。`src/claude_renew.rs` のログイン更新は、CodexBarの委任リフレッシュをRustに移植したものです（Copyright (c) 2026 Peter Steinberger、MIT License）。ライセンス文は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) にあります。皆さんの公開があったからこそ、この機能を作れました。
 
 ## ライセンス
 
